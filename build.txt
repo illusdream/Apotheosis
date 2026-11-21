@@ -1,0 +1,5 @@
+displayName = Apotheosis
+displayName.zh-Hans = Apotheosis
+author = YumeiL
+version = 0.1
+buildIgnore = Generator\*, DebugTool\*, *.slnx, *.sln, *.csproj, *.user, .idea\*, .vs\*, .git\*, .gitignore, bin\*, obj\*, *.md

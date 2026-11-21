@@ -1,0 +1,71 @@
+<Project>
+	<!-- Set the default before the SDK initializes configuration-specific paths. -->
+	<PropertyGroup>
+		<Configurations>Development;Release</Configurations>
+		<Configuration Condition="'$(Configuration)' == ''">Development</Configuration>
+	</PropertyGroup>
+	<Import Project="Sdk.props" Sdk="Microsoft.NET.Sdk" />
+
+	<!-- Import tModLoader mod properties -->
+	<Import Project="..\tModLoader.targets" />
+
+	<PropertyGroup Condition="'$(Configuration)' == 'Development'">
+		<Optimize>false</Optimize>
+		<DebugSymbols>true</DebugSymbols>
+		<DebugType>portable</DebugType>
+		<DefineConstants>$(DefineConstants);DEBUG</DefineConstants>
+		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+		<CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+	</PropertyGroup>
+
+	<PropertyGroup Condition="'$(Configuration)' == 'Release'">
+		<Optimize>true</Optimize>
+		<DefaultItemExcludes>$(DefaultItemExcludes);DebugTool/**</DefaultItemExcludes>
+	</PropertyGroup>
+
+	<!-- Exclude embedded Roslyn generator & disk-emitted Generated/ from MSBuild globs.
+	     Generated/ is still picked up by tML's in-game ModCompile (Build / Publish). -->
+	<PropertyGroup>
+		<DefaultItemExcludes>$(DefaultItemExcludes);Generator/**;Generated/**</DefaultItemExcludes>
+		<EmitCompilerGeneratedFiles>true</EmitCompilerGeneratedFiles>
+		<CompilerGeneratedFilesOutputPath>Generated</CompilerGeneratedFilesOutputPath>
+	</PropertyGroup>
+
+	<!-- Remove manual AdditionalFiles globs from tMLMod.targets inside Generator/ and Generated/,
+	     and feed supported asset files to Roslyn source generators (e.g., AssetPathGenerator). -->
+	<ItemGroup>
+		<AdditionalFiles Remove="**/*.png;**/*.rawimg;**/*.fxc;**/*.xnb;**/*.ogg;**/*.wav;**/*.mp3" />
+		<AdditionalFiles Include="**/*.png;**/*.rawimg;**/*.fxc;**/*.xnb;**/*.ogg;**/*.wav;**/*.mp3"
+		                 Exclude="Generator/**;Generated/**;bin/**;obj/**;.idea/**;.git/**" />
+		<AdditionalFiles Remove="Generator/**;Generated/**" />
+	</ItemGroup>
+
+	<!-- Clean stale generated files before compile/clean so renamed/removed generators never break tML builds -->
+	<Target Name="CleanGeneratedFilesBeforeCompile" BeforeTargets="CoreCompile">
+		<RemoveDir Directories="$(ProjectDir)Generated" Condition="Exists('$(ProjectDir)Generated')" />
+		<MakeDir Directories="$(ProjectDir)Generated" />
+	</Target>
+	<Target Name="CleanGeneratedFilesOnClean" AfterTargets="Clean">
+		<RemoveDir Directories="$(ProjectDir)Generated" Condition="Exists('$(ProjectDir)Generated')" />
+	</Target>
+
+	<!-- Development-only Dear ImGui (Hexa.NET.ImGui) debug panel -->
+	<ItemGroup Condition="'$(Configuration)' == 'Development'">
+		<PackageReference Include="Hexa.NET.ImGui" Version="2.2.9" />
+	</ItemGroup>
+
+	<Target Name="AddDebugToolBinDirMetadata" BeforeTargets="GetAssemblyAttributes" Condition="'$(Configuration)' == 'Development'">
+		<ItemGroup>
+			<AssemblyMetadata Include="ApotheosisDebugToolBinDir" Value="$(TargetDir)" />
+		</ItemGroup>
+	</Target>
+
+	<!-- References -->
+	<ItemGroup>
+		<ProjectReference Include="Generator\Apotheosis.Generator.csproj"
+		                  OutputItemType="Analyzer"
+		                  ReferenceOutputAssembly="false" />
+	</ItemGroup>
+
+	<Import Project="Sdk.targets" Sdk="Microsoft.NET.Sdk" />
+</Project>

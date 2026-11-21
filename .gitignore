@@ -1,0 +1,20 @@
+# Build results & Roslyn generated files (emitted for tML in-game builds)
+bin/
+obj/
+Generated/
+*.tmod
+
+# IDE & editor files
+.idea/
+.vs/
+*.user
+*.suo
+*.sln.docstates
+*.DotSettings.user
+
+# Logs & OS files
+*.log
+*.tmp
+*.bak
+Thumbs.db
+.DS_Store
