@@ -109,8 +109,7 @@ internal static class AssetPathResolver
         {
             ".png" => 0,
             ".rawimg" => 1,
-            ".fxc" => 0,
-            ".xnb" => 1,
+            ".xnb" => 0,
             ".ogg" => 0,
             ".wav" => 1,
             ".mp3" => 2,
@@ -205,9 +204,6 @@ internal static class AssetPathResolver
             case ".png":
             case ".rawimg":
                 return AssetKind.Texture;
-
-            case ".fxc":
-                return AssetKind.Effect;
 
             case ".ogg":
             case ".wav":

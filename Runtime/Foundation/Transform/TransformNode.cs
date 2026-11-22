@@ -46,7 +46,7 @@ namespace Apotheosis.Runtime.Foundation.Transform
         /// <summary>
         /// 节点复用代际号（永不为 0，每次从对象池借出时自增），配合 <see cref="TransformHandle"/> 杜绝悬挂引用与串台。
         /// </summary>
-        public uint Generation { get; private set; } = 1;
+        public uint Generation { get; private set; } = RuntimeConstants.InitialGeneration;
 
         /// <summary>该节点是否由对象池分配，清理结束后是否会自动归还池。</summary>
         public bool IsPooled => _poolReturnAction is not null;
@@ -84,7 +84,7 @@ namespace Apotheosis.Runtime.Foundation.Transform
         internal void InitializeFromPool(Action<TransformNode> returnAction, Transform3D initialTransform, string? name)
         {
             uint nextGen = Generation + 1;
-            Generation = nextGen == 0 ? 1u : nextGen;
+            Generation = nextGen == RuntimeConstants.IndexNone ? RuntimeConstants.InitialGeneration : nextGen;
 
             _poolReturnAction = returnAction;
             InPool = false;

@@ -23,30 +23,75 @@
 		<DefaultItemExcludes>$(DefaultItemExcludes);DebugTool/**</DefaultItemExcludes>
 	</PropertyGroup>
 
-	<!-- Exclude embedded Roslyn generator & disk-emitted Generated/ from MSBuild globs.
+	<!-- Exclude embedded Roslyn generator, build tools & disk-emitted Generated/ from MSBuild globs.
 	     Generated/ is still picked up by tML's in-game ModCompile (Build / Publish). -->
 	<PropertyGroup>
-		<DefaultItemExcludes>$(DefaultItemExcludes);Generator/**;Generated/**</DefaultItemExcludes>
+		<DefaultItemExcludes>$(DefaultItemExcludes);Generator/**;Generated/**;Tools/**</DefaultItemExcludes>
 		<EmitCompilerGeneratedFiles>true</EmitCompilerGeneratedFiles>
 		<CompilerGeneratedFilesOutputPath>Generated</CompilerGeneratedFilesOutputPath>
+		<ShaderMetaOutputDir>$(MSBuildProjectDirectory)\obj\ShaderMeta</ShaderMetaOutputDir>
 	</PropertyGroup>
 
-	<!-- Remove manual AdditionalFiles globs from tMLMod.targets inside Generator/ and Generated/,
-	     and feed supported asset files to Roslyn source generators (e.g., AssetPathGenerator). -->
+	<!-- Remove manual AdditionalFiles globs from tMLMod.targets inside Generator/, Generated/ and Tools/,
+	     and feed supported asset files (only .xnb for shaders) + shader metadata to Roslyn source generators. -->
 	<ItemGroup>
 		<AdditionalFiles Remove="**/*.png;**/*.rawimg;**/*.fxc;**/*.xnb;**/*.ogg;**/*.wav;**/*.mp3" />
-		<AdditionalFiles Include="**/*.png;**/*.rawimg;**/*.fxc;**/*.xnb;**/*.ogg;**/*.wav;**/*.mp3"
-		                 Exclude="Generator/**;Generated/**;bin/**;obj/**;.idea/**;.git/**" />
-		<AdditionalFiles Remove="Generator/**;Generated/**" />
+		<AdditionalFiles Include="**/*.png;**/*.rawimg;**/*.xnb;**/*.ogg;**/*.wav;**/*.mp3"
+		                 Exclude="Generator/**;Generated/**;Tools/**;bin/**;obj/**;.idea/**;.git/**" />
+		<AdditionalFiles Include="$(ShaderMetaOutputDir)\**\*.shader.meta.json"
+		                 Condition="Exists('$(ShaderMetaOutputDir)')"
+		                 IsShaderMeta="true" />
+		<AdditionalFiles Remove="Generator/**;Generated/**;Tools/**" />
 	</ItemGroup>
 
-	<!-- Clean stale generated files before compile/clean so renamed/removed generators never break tML builds -->
-	<Target Name="CleanGeneratedFilesBeforeCompile" BeforeTargets="CoreCompile">
+	<!-- Incremental build-time shader pipeline: compile .fx -> uncompressed SM 3.0 .xnb and extract .xnb parameter metadata for Roslyn.
+	     Skipped during IDE design-time builds; build order with ShaderTools is enforced by the non-referencing ProjectReference below. -->
+	<Target Name="PrepareShaders"
+	        BeforeTargets="CoreCompile;CleanGeneratedFilesBeforeCompile"
+	        Condition="'$(DesignTimeBuild)' != 'true' and '$(BuildingProject)' == 'true'">
+		<PropertyGroup>
+			<_ShaderToolsProject>$(ProjectDir)Tools\Apotheosis.ShaderTools\Apotheosis.ShaderTools.csproj</_ShaderToolsProject>
+			<_ShaderToolsAssetsFile>$(ProjectDir)Tools\Apotheosis.ShaderTools\obj\project.assets.json</_ShaderToolsAssetsFile>
+			<_ShaderToolsDll>$(ProjectDir)Tools\Apotheosis.ShaderTools\bin\$(Configuration)\net10.0\Apotheosis.ShaderTools.dll</_ShaderToolsDll>
+			<_DotNetHost Condition="'$(DOTNET_HOST_PATH)' != ''">$(DOTNET_HOST_PATH)</_DotNetHost>
+			<_DotNetHost Condition="'$(_DotNetHost)' == ''">dotnet</_DotNetHost>
+		</PropertyGroup>
+
+		<!-- Fallback only when built with BuildProjectReferences=false and ShaderTools output does not exist yet -->
+		<MSBuild Projects="$(_ShaderToolsProject)"
+		         Targets="Restore"
+		         RemoveProperties="TargetFramework;RuntimeIdentifier;Platform;SelfContained"
+		         Condition="!Exists('$(_ShaderToolsAssetsFile)')" />
+
+		<MSBuild Projects="$(_ShaderToolsProject)"
+		         Targets="Build"
+		         Properties="Configuration=$(Configuration)"
+		         RemoveProperties="TargetFramework;RuntimeIdentifier;Platform;SelfContained"
+		         Condition="!Exists('$(_ShaderToolsDll)')" />
+
+		<Exec Command="&quot;$(_DotNetHost)&quot; &quot;$(_ShaderToolsDll)&quot; --project-dir &quot;$(MSBuildProjectDirectory)&quot; --meta-dir &quot;$(ShaderMetaOutputDir)&quot; --mod-name &quot;$(RootNamespace)&quot;" />
+
+		<!-- Re-glob Assets/**/*.xnb and ShaderMeta in memory so newly compiled or deleted shaders never trigger CS2001 -->
+		<ItemGroup>
+			<AdditionalFiles Remove="@(AdditionalFiles)" Condition="'%(AdditionalFiles.IsShaderMeta)' == 'true'" />
+			<AdditionalFiles Remove="@(AdditionalFiles)" Condition="'%(AdditionalFiles.Extension)' == '.xnb' and $([System.String]::Copy('%(AdditionalFiles.Identity)').Replace('\', '/').StartsWith('Assets/', System.StringComparison.OrdinalIgnoreCase))" />
+			<AdditionalFiles Include="Assets\**\*.xnb" />
+			<AdditionalFiles Include="$(ShaderMetaOutputDir)\**\*.shader.meta.json" Condition="Exists('$(ShaderMetaOutputDir)')" IsShaderMeta="true" />
+		</ItemGroup>
+	</Target>
+
+	<!-- Clean stale generated files ONLY when CoreCompile inputs are newer than IntermediateAssembly (never wipe Generated/ on up-to-date incremental builds or design-time builds). -->
+	<Target Name="CleanGeneratedFilesBeforeCompile"
+	        BeforeTargets="CoreCompile"
+	        Inputs="@(Compile);@(AdditionalFiles);@(Analyzer)"
+	        Outputs="@(IntermediateAssembly)"
+	        Condition="'$(DesignTimeBuild)' != 'true' and '$(BuildingProject)' == 'true'">
 		<RemoveDir Directories="$(ProjectDir)Generated" Condition="Exists('$(ProjectDir)Generated')" />
 		<MakeDir Directories="$(ProjectDir)Generated" />
 	</Target>
 	<Target Name="CleanGeneratedFilesOnClean" AfterTargets="Clean">
 		<RemoveDir Directories="$(ProjectDir)Generated" Condition="Exists('$(ProjectDir)Generated')" />
+		<RemoveDir Directories="$(ShaderMetaOutputDir)" Condition="Exists('$(ShaderMetaOutputDir)')" />
 	</Target>
 
 	<!-- Development-only Dear ImGui (Hexa.NET.ImGui) debug panel -->
@@ -57,6 +102,7 @@
 	<Target Name="AddDebugToolBinDirMetadata" BeforeTargets="GetAssemblyAttributes" Condition="'$(Configuration)' == 'Development'">
 		<ItemGroup>
 			<AssemblyMetadata Include="ApotheosisDebugToolBinDir" Value="$(TargetDir)" />
+			<AssemblyMetadata Include="ApotheosisProjectDir" Value="$(MSBuildProjectDirectory)" />
 		</ItemGroup>
 	</Target>
 
@@ -65,6 +111,11 @@
 		<ProjectReference Include="Generator\Apotheosis.Generator.csproj"
 		                  OutputItemType="Analyzer"
 		                  ReferenceOutputAssembly="false" />
+		<ProjectReference Include="Tools\Apotheosis.ShaderTools\Apotheosis.ShaderTools.csproj"
+		                  ReferenceOutputAssembly="false"
+		                  OutputItemType="None"
+		                  SkipGetTargetFrameworkProperties="true"
+		                  Private="false" />
 	</ItemGroup>
 
 	<Import Project="Sdk.targets" Sdk="Microsoft.NET.Sdk" />

@@ -98,7 +98,7 @@ namespace Apotheosis.Runtime.Foundation.Transform.Bindings
 
             _target = null;
             _resolver = null;
-            _whoAmI = -1;
+            _whoAmI = RuntimeConstants.InvalidIndex;
             SyncMode = TransformSyncMode.Manual;
             SyncFlags = TransformSyncFlags.None;
             _inPool = true;
@@ -199,7 +199,7 @@ namespace Apotheosis.Runtime.Foundation.Transform.Bindings
             _target = null;
             _resolver = null;
             _expectedModNpc = null;
-            _whoAmI = -1;
+            _whoAmI = RuntimeConstants.InvalidIndex;
             _expectedType = 0;
             _defaultCleanupOverride = null;
             SyncMode = TransformSyncMode.Manual;
@@ -302,7 +302,7 @@ namespace Apotheosis.Runtime.Foundation.Transform.Bindings
             _target = null;
             _resolver = null;
             _expectedModProj = null;
-            _whoAmI = -1;
+            _whoAmI = RuntimeConstants.InvalidIndex;
             _expectedType = 0;
             _defaultCleanupOverride = null;
             SyncMode = TransformSyncMode.Manual;
@@ -405,7 +405,7 @@ namespace Apotheosis.Runtime.Foundation.Transform.Bindings
             _target = null;
             _resolver = null;
             _expectedInner = null;
-            _whoAmI = -1;
+            _whoAmI = RuntimeConstants.InvalidIndex;
             _expectedType = 0;
             _defaultCleanupOverride = null;
             SyncMode = TransformSyncMode.Manual;

@@ -35,7 +35,8 @@ namespace Apotheosis.DebugTool.Gizmos
 
         private struct RenderContext
         {
-            public ImDrawListPtr DrawList;
+            // 注意：值类型字段不直接引用 ImDrawListPtr，避免 tML 加载期 GetLoadableTypes() 布局 struct 时提前解析 Hexa.NET.ImGui
+            public nint DrawListHandle;
             public WorldScreenTransform Transform;
             public GizmoSettings Settings;
             public List<NumVec2> ScreenScratch;
@@ -46,6 +47,8 @@ namespace Apotheosis.DebugTool.Gizmos
             public int Submitted;
             public int Rendered;
             public int Culled;
+
+            public unsafe ImDrawListPtr DrawList => new((ImDrawList*)DrawListHandle);
         }
 
         private readonly List<NumVec2> _screenScratch = new(128);
@@ -61,7 +64,7 @@ namespace Apotheosis.DebugTool.Gizmos
         /// <summary>
         /// 执行单帧世界空间 Gizmos 采集与绘制。
         /// </summary>
-        public void Render(GizmoCommandBuffer buffer, int backBufferWidth, int backBufferHeight)
+        public unsafe void Render(GizmoCommandBuffer buffer, int backBufferWidth, int backBufferHeight)
         {
             if (!buffer.IsEnabled)
                 return;
@@ -72,7 +75,7 @@ namespace Apotheosis.DebugTool.Gizmos
 
             var ctx = new RenderContext
             {
-                DrawList = drawList,
+                DrawListHandle = (nint)drawList.Handle,
                 Transform = transform,
                 Settings = settings,
                 ScreenScratch = _screenScratch,

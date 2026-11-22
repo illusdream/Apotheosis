@@ -5,4 +5,5 @@
   </Configurations>
   <Project Path="Apotheosis.csproj" />
   <Project Path="Generator/Apotheosis.Generator.csproj" />
+  <Project Path="Tools/Apotheosis.ShaderTools/Apotheosis.ShaderTools.csproj" />
 </Solution>
