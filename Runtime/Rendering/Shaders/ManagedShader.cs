@@ -22,14 +22,7 @@ namespace Apotheosis.Runtime.Rendering.Shaders
         public const string Zoom = "uZoom";
     }
 
-    /// <summary>
-    /// 受管着色器唯一实例：由 <see cref="ShaderModule"/> 统一持有，封装底层 FNA <see cref="Effect"/>、
-    /// 编译期参数名对应的 <see cref="EffectParameter"/> 缓存数组、常用全局参数直连槽以及 Technique/Pass 缓存。
-    /// <para>
-    /// 句柄注册与 GPU 资源加载解耦：工作线程可安全获取本实例对应的 <see cref="ShaderHandle"/> 写入 <c>RenderCommand</c>，
-    /// 实际的 <see cref="ModContent.Request{Effect}"/> 与参数绑定延迟到主线程首次使用（如 <see cref="Apply"/>）时执行。
-    /// </para>
-    /// </summary>
+    /// <summary>受管着色器实例，封装底层 FNA <see cref="Effect"/> 与参数/Pass 缓存。</summary>
     public sealed class ManagedShader : IShader
     {
         [Flags]
@@ -125,10 +118,7 @@ namespace Apotheosis.Runtime.Rendering.Shaders
         /// <summary>已缓存的 Technique 数量。</summary>
         public int TechniqueCount => EnsureBound() ? _techniques.Length : 0;
 
-        /// <summary>
-        /// 若该实例此前以空参数表注册（例如手动无参调用 <c>GetOrLoad</c>），后续经由生成代码访问时原子发布槽位表，
-        /// 实际绑定延迟到主线程 <see cref="EnsureBound"/> 通过引用比对自动完成，彻底消除并发脏标志丢失窗口。
-        /// </summary>
+        /// <summary>为以空参数表注册的实例补充自定义参数名布局。</summary>
         internal void EnsureParameterLayout(string[] parameterNames)
         {
             if (parameterNames.Length == 0 || Volatile.Read(ref _parameterNames).Length > 0)
@@ -200,14 +190,7 @@ namespace Apotheosis.Runtime.Rendering.Shaders
             _dirtyGlobalParams = GlobalOverrideFlags.None;
         }
 
-        /// <summary>
-        /// 同步当前绘制所需的帧级全局参数：
-        /// <list type="bullet">
-        ///   <item>同一修订周期内无手动覆写且矩阵模式未切换时 O(1) 零写入跳过；</item>
-        ///   <item>本次绘制前手动调用 <c>SetTime</c>/<c>SetTransformMatrix</c> 等覆写的参数会被保留，且不会提前触发上下文采集；</item>
-        ///   <item>下一次未手动覆写的绘制会自动恢复当前帧默认值，杜绝同帧跨绘制状态泄漏。</item>
-        /// </list>
-        /// </summary>
+        /// <summary>同步当前绘制所需的帧级全局参数（保留本次手动覆写并自动恢复后续默认）。</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void SyncFrameGlobalsIfNeeded(in RenderFrameContext context, bool useSpriteBatchProjection = false)
         {
@@ -260,14 +243,19 @@ namespace Apotheosis.Runtime.Rendering.Shaders
             Apply(in RenderManager.FrameContextRef, techniqueIndex, passIndex);
         }
 
-        /// <summary>
-        /// 使用指定帧上下文同步全局参数并应用 Technique/Pass（供 <see cref="ShaderModule"/> 与后续合批调度器热路径调用）。
-        /// </summary>
+        /// <summary>同步帧全局参数并应用指定 Technique/Pass。</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void Apply(in RenderFrameContext context, int techniqueIndex = 0, int passIndex = 0)
         {
+            TryApply(in context, techniqueIndex, passIndex);
+        }
+
+        /// <summary>尝试同步帧全局参数并应用指定 Pass；仅在底层实际应用成功时返回 <c>true</c>。</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal bool TryApply(in RenderFrameContext context, int techniqueIndex = 0, int passIndex = 0)
+        {
             if (!EnsureBound())
-                return;
+                return false;
 
             SyncFrameGlobalsIfNeeded(in context, useSpriteBatchProjection: false);
 
@@ -279,7 +267,7 @@ namespace Apotheosis.Runtime.Rendering.Shaders
                     $"tech:{AssetPath}:{techniqueIndex}",
                     $"[Shader] '{AssetPath}' Technique index {techniqueIndex} out of range (count={techniques.Length}).");
 #endif
-                return;
+                return false;
             }
 
             EffectPass[] passes = _passes[techniqueIndex];
@@ -290,7 +278,7 @@ namespace Apotheosis.Runtime.Rendering.Shaders
                     $"pass:{AssetPath}:{techniqueIndex}:{passIndex}",
                     $"[Shader] '{AssetPath}' Pass index {passIndex} out of range for technique {techniqueIndex} (count={passes.Length}).");
 #endif
-                return;
+                return false;
             }
 
             Effect effect = _boundEffect!;
@@ -299,13 +287,10 @@ namespace Apotheosis.Runtime.Rendering.Shaders
                 effect.CurrentTechnique = targetTechnique;
 
             passes[passIndex].Apply();
+            return true;
         }
 
-        /// <summary>
-        /// 供 <see cref="SpriteBatch"/> 场景使用：同步帧全局参数（其中 <c>uTransformMatrix</c> 自动写入活动视口正交投影
-        /// <see cref="RenderFrameContext.ProjectionMatrix"/> 以匹配 <see cref="SpriteBatch"/> 预变换顶点，除非手动覆写）
-        /// 并返回已准备就绪的底层 <see cref="Effect"/>。
-        /// </summary>
+        /// <summary>同步 <see cref="SpriteBatch"/> 所需的全局参数并返回底层 <see cref="Effect"/>。</summary>
         public Effect? PrepareForSpriteBatch(int techniqueIndex = 0)
         {
             if (!EnsureBound())
@@ -429,7 +414,17 @@ namespace Apotheosis.Runtime.Rendering.Shaders
         public void SetTexture(int slot, Texture? value)
         {
             EffectParameter? param = GetCachedParameter(slot);
-            param?.SetValue(value);
+            if (param is null)
+                return;
+
+            if (param.ParameterType is EffectParameterType.Texture
+                or EffectParameterType.Texture1D
+                or EffectParameterType.Texture2D
+                or EffectParameterType.Texture3D
+                or EffectParameterType.TextureCube)
+            {
+                param.SetValue(value);
+            }
         }
 
         /// <summary>按名称兜底查找底层 <see cref="EffectParameter"/>（非常规/动态调试用途，热路径请使用槽位 Setter）。</summary>

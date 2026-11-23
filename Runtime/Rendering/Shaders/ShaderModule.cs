@@ -13,16 +13,7 @@ using Terraria;
 
 namespace Apotheosis.Runtime.Rendering.Shaders
 {
-    /// <summary>
-    /// 着色器管理模块（由 <see cref="RenderManager"/> 托管）：
-    /// 负责线程安全的 2 字节 <see cref="ShaderHandle"/> 注册、路径去重、定长无扩容数组 O(1) 寻址、
-    /// 主线程惰性 GPU 资源加载与全局参数同步。
-    /// <para>
-    /// 由于槽位数组固定为 256 项（永不 <c>Array.Resize</c>），且句柄注册与 GPU <c>Effect</c> 加载解耦，
-    /// 工作线程可随时安全读取 <c>Assets.Shaders.*</c> 获取 <see cref="ShaderHandle"/> 并写入 <c>RenderCommand</c>，
-    /// 无需预先在主线程手动预热；实际的 GPU 加载与 <c>Apply()</c> 仍在主线程执行。
-    /// </para>
-    /// </summary>
+    /// <summary>着色器管理模块，负责句柄注册、路径去重、主线程按需加载与全局参数同步。</summary>
     public sealed class ShaderModule
     {
         // 定长 256 槽位（槽位 0 保留为 null，1..255 对应 8 位 SlotIndex），永不扩容，保证并发无锁读取安全
@@ -100,11 +91,7 @@ namespace Apotheosis.Runtime.Rendering.Shaders
         }
 #endif
 
-        /// <summary>
-        /// 线程安全地注册或获取受管着色器句柄，确保同一 <paramref name="assetPath"/> 全局只存在一份 <see cref="ManagedShader"/> 实例。
-        /// 本方法只执行纯 CPU 槽位注册，不触发 FNA GPU 调用，因此工作线程也可以安全调用以写入 <c>RenderCommand</c>；
-        /// 在独立服务端（<see cref="Main.dedServ"/>）环境下安全返回 <see cref="ShaderHandle.Invalid"/>。
-        /// </summary>
+        /// <summary>注册或获取指定资源路径对应的受管着色器句柄（服务端返回无效句柄）。</summary>
         public ShaderHandle GetOrLoad(string assetPath, string[]? parameterNames = null)
         {
             if (Main.dedServ || string.IsNullOrWhiteSpace(assetPath))
