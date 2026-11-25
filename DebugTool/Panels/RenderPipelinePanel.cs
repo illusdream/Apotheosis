@@ -14,6 +14,7 @@ using Apotheosis.Runtime.Rendering.Geometry;
 using Apotheosis.Runtime.Rendering.Materials;
 using Apotheosis.Runtime.Rendering.Targets;
 using Hexa.NET.ImGui;
+using Microsoft.Xna.Framework.Graphics;
 using Terraria;
 using Terraria.GameContent;
 using Terraria.ModLoader;
@@ -25,15 +26,12 @@ using XnaVec4 = Microsoft.Xna.Framework.Vector4;
 
 namespace Apotheosis.DebugTool.Panels
 {
-    /// <summary>
-    /// 渲染管线诊断与实测验证面板（仅 Development 模式自动注册）：
-    /// 实时展示 8B <see cref="RenderCommand"/> 合批统计，并提供 6 项默认关闭的内置验证开关
-    /// （多拖尾合批、动态魔法阵、Transform 静态网格、2D 散装精灵、多分组万级硬件实例化与工作线程并发录制）。
-    /// </summary>
+    /// <summary>渲染管线与 RT 池诊断验证面板（仅 Development 模式自动注册，内置 7 项默认关闭的实测开关）。</summary>
     [NoJIT]
     internal sealed class RenderPipelinePanel : IDebugPanel
     {
         private const int DemoTrailCount = 6;
+        private const string OffscreenDemoChannelName = "Debug.OffscreenDemo";
 
         private bool _demoTrails;
         private bool _demoMagicCircle;
@@ -41,6 +39,7 @@ namespace Apotheosis.DebugTool.Panels
         private bool _demoSprites;
         private bool _demoInstanced;
         private bool _demoWorkerThread;
+        private bool _demoOffscreenChannel;
 
         private int _instancedCount = 2000;
         private float _elapsed;
@@ -59,6 +58,13 @@ namespace Apotheosis.DebugTool.Panels
         private MeshHandle _instancedDiamondBase;
         private MultiGroupInstancedMesh? _instancedSwarm;
         private MeshHandle _instancedSwarmHandle;
+
+        // Demo 7：离屏命名帧通道验证资源
+        private RenderTargetHandle _offscreenChannelHandle;
+        private bool _offscreenChannelRegistered;
+        private MeshHandle _offscreenRingHandle;
+        private bool _offscreenCompositeHooked;
+        private int _lastManualEvictCount;
 
         // 双缓冲工作线程网格（Ping-Pong 避免与主线程 Flush 并发读写同一 DynamicMesh）
         private readonly MeshHandle[] _workerMeshHandles = new MeshHandle[2];
@@ -259,6 +265,27 @@ namespace Apotheosis.DebugTool.Panels
                     });
                 }
             }
+
+            // 7. 离屏命名帧通道绘制（PreDrawOffscreen 写入离屏 RT，同帧 DrawDust 阶段读取 CurrentTexture 合成回主屏）
+            if (_demoOffscreenChannel)
+            {
+                EnsureOffscreenDemoInitialized();
+
+                DynamicMesh mesh = RenderManager.Meshes.GetDynamic(_offscreenRingHandle);
+                mesh.Clear();
+
+                float pulse = 1f + 0.08f * MathF.Sin(_elapsed * 3.1f);
+                var aqua = new XnaColor(60, 245, 220, 235);
+                var gold = new XnaColor(255, 215, 95, 225);
+                var violet = new XnaColor(185, 110, 255, 210);
+
+                mesh.AddRing(center, 152f * pulse, thickness: 3.5f, segments: 64, aqua);
+                mesh.AddRing(center, 118f * pulse, thickness: 2.2f, segments: 48, violet);
+                mesh.AddPolygon(center, 118f * pulse, sides: 4, thickness: 2.8f, rotation: _elapsed * 1.1f, gold);
+                mesh.AddPolygon(center, 118f * pulse, sides: 4, thickness: 2.8f, rotation: _elapsed * 1.1f + MathF.PI * 0.25f, aqua);
+
+                RenderManager.Commands.Submit(_offscreenChannelHandle, RenderManager.Materials.DefaultAdditive2D, _offscreenRingHandle, subLayer: 0, sortOrder: 0);
+            }
         }
 
         public void OnDraw()
@@ -313,6 +340,46 @@ namespace Apotheosis.DebugTool.Panels
                 ImGui.EndTable();
             }
 
+            CyberpunkWidgets.SectionHeader("RT_POOL_TELEMETRY", "POOL_AND_VRAM");
+
+            RenderTargetStats rtStats = RenderManager.Targets.GetStats();
+            double totalVramMb = rtStats.TotalEstimatedVramBytes / (1024.0 * 1024.0);
+            long totalLeases = rtStats.TotalCreated + rtStats.TotalReused;
+            double hitRatePct = totalLeases > 0 ? (rtStats.TotalReused * 100.0 / totalLeases) : 0.0;
+
+            CyberpunkWidgets.MetricCard("POOL_ACTIVE", $"{rtStats.ActiveTransientCount}T / {rtStats.ActiveChannelLeaseCount}C", CyberpunkTheme.NeonCyan, cardW);
+            ImGui.SameLine(0f, 8f);
+            CyberpunkWidgets.MetricCard("POOL_IDLE", $"{rtStats.IdlePooledCount}", CyberpunkTheme.NeonGreen, cardW);
+
+            CyberpunkWidgets.MetricCard("EST_VRAM", $"{totalVramMb:F2} MB", CyberpunkTheme.AcidYellow, cardW);
+            ImGui.SameLine(0f, 8f);
+            CyberpunkWidgets.MetricCard("REUSE_HIT", $"{hitRatePct:F1}%", CyberpunkTheme.NeonMagenta, cardW);
+
+            ImGui.TextUnformatted(
+                $"Ref: {rtStats.ReferenceWidth}x{rtStats.ReferenceHeight}  |  " +
+                $"Channels: {rtStats.RegisteredChannelCount}  |  " +
+                $"Persistent: {rtStats.PersistentCount}  |  " +
+                $"Rebuilds: {rtStats.ResizeRebuilds}");
+            ImGui.TextUnformatted(
+                $"Created: {rtStats.TotalCreated}  |  " +
+                $"Reused: {rtStats.TotalReused}  |  " +
+                $"Evicted: {rtStats.TotalEvicted}");
+
+            if (rtStats.SuspectedLeakCount > 0)
+            {
+                ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(1f, 0.35f, 0.35f, 1f));
+                ImGui.TextUnformatted($"[WARNING] Suspected Transient RT Leaks: {rtStats.SuspectedLeakCount}");
+                ImGui.PopStyleColor();
+            }
+
+            if (ImGui.Button("立即回收全部空闲 RT"))
+                _lastManualEvictCount = RenderManager.Targets.EvictIdleTargets();
+            if (_lastManualEvictCount > 0)
+            {
+                ImGui.SameLine();
+                ImGui.TextUnformatted($"(上次释放 {_lastManualEvictCount} 张)");
+            }
+
             CyberpunkWidgets.SectionHeader("VERIFICATION_DEMOS", Main.gameMenu ? "ENTER_WORLD" : "READY");
 
             if (Main.gameMenu)
@@ -336,6 +403,7 @@ namespace Apotheosis.DebugTool.Panels
             }
 
             ImGui.Checkbox($"6. 后台工作线程并发录制验证 (已提交 {Volatile.Read(ref _workerSubmittedFrames)} 次)", ref _demoWorkerThread);
+            ImGui.Checkbox("7. 离屏命名帧通道绘制 + 主屏合成 (PooledFrameRenderTarget)", ref _demoOffscreenChannel);
         }
 
         public void OnUnload()
@@ -347,6 +415,15 @@ namespace Apotheosis.DebugTool.Panels
             _demoSprites = false;
             _demoInstanced = false;
             _demoWorkerThread = false;
+            _demoOffscreenChannel = false;
+
+            if (_offscreenCompositeHooked)
+            {
+                On_Main.DrawDust -= Hook_DrawDustCompositeOffscreenDemo;
+                _offscreenCompositeHooked = false;
+            }
+            _offscreenChannelRegistered = false;
+            _offscreenChannelHandle = default;
 
             if (_workerTask is not null)
             {
@@ -367,6 +444,12 @@ namespace Apotheosis.DebugTool.Panels
             {
                 RenderManager.Meshes.ReleaseDynamic(_magicCircleHandle);
                 _magicCircleHandle = default;
+            }
+
+            if (_offscreenRingHandle.IsValid)
+            {
+                RenderManager.Meshes.ReleaseDynamic(_offscreenRingHandle);
+                _offscreenRingHandle = default;
             }
 
             if (_staticStarInstanceHandle.IsValid)
@@ -488,6 +571,59 @@ namespace Apotheosis.DebugTool.Panels
                 RenderManager.Meshes.UnitQuad2D,
                 _instancedDiamondBase);
             _instancedSwarmHandle = RenderManager.Meshes.Register(_instancedSwarm);
+        }
+
+        private void EnsureOffscreenDemoInitialized()
+        {
+            if (!_offscreenChannelRegistered)
+            {
+                RenderTargetDescriptor desc = RenderTargetDescriptor.ScreenRelative(scale: 1f);
+                _offscreenChannelHandle = RenderManager.Targets.RegisterPooledChannel(OffscreenDemoChannelName, RenderTiming.PreDrawOffscreen, in desc);
+                _offscreenChannelRegistered = true;
+            }
+
+            if (!_offscreenRingHandle.IsValid)
+                _offscreenRingHandle = RenderManager.Meshes.AcquireDynamic(512, 1536);
+
+            if (!_offscreenCompositeHooked)
+            {
+                On_Main.DrawDust += Hook_DrawDustCompositeOffscreenDemo;
+                _offscreenCompositeHooked = true;
+            }
+        }
+
+        private void Hook_DrawDustCompositeOffscreenDemo(On_Main.orig_DrawDust orig, Main self)
+        {
+            orig(self);
+
+            if (_unloaded || RenderManager.IsUnloading || !_demoOffscreenChannel || Main.dedServ || Main.gameMenu || !_offscreenChannelRegistered)
+                return;
+
+            GraphicsDevice? gd = Main.graphics?.GraphicsDevice;
+            if (gd is null || gd.IsDisposed)
+                return;
+
+            if (!RenderManager.Targets.TryGetChannel(_offscreenChannelHandle, out PooledFrameRenderTarget? channel))
+                return;
+
+            RenderTarget2D? offscreenTex = channel.CurrentTexture;
+            if (offscreenTex is null || offscreenTex.IsDisposed)
+                return;
+
+            Viewport vp = gd.Viewport;
+            int destW = vp.Width > 0 ? vp.Width : Main.screenWidth;
+            int destH = vp.Height > 0 ? vp.Height : Main.screenHeight;
+
+            // 在 SpriteBatch 已关闭的间隙将离屏通道按当前活动视口 1:1 叠加合成
+            Main.spriteBatch.Begin(SpriteSortMode.Immediate, BlendState.Additive, SamplerState.LinearClamp, DepthStencilState.None, RasterizerState.CullNone);
+            try
+            {
+                Main.spriteBatch.Draw(offscreenTex, new XnaRect(0, 0, destW, destH), XnaColor.White);
+            }
+            finally
+            {
+                Main.spriteBatch.End();
+            }
         }
     }
 }

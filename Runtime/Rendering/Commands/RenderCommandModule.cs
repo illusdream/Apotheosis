@@ -331,11 +331,9 @@ namespace Apotheosis.Runtime.Rendering.Commands
                 int primitivesDrawn = 0;
                 int instancesDrawn = 0;
 
-                ref readonly RenderFrameContext frameContext = ref RenderManager.FrameContextRef;
-
                 using (RenderStateScope.Capture(gd))
                 {
-                    ExecuteBatches(gd, in frameContext, ref drawCalls, ref primitivesDrawn, ref instancesDrawn);
+                    ExecuteBatches(gd, ref drawCalls, ref primitivesDrawn, ref instancesDrawn);
                 }
 
                 ref RenderTimingStats cur = ref _currentStats[(int)timing];
@@ -607,12 +605,12 @@ namespace Apotheosis.Runtime.Rendering.Commands
             }
         }
 
-        private void ExecuteBatches(GraphicsDevice gd, in RenderFrameContext initialContext, ref int drawCalls, ref int primitivesDrawn, ref int instancesDrawn)
+        private void ExecuteBatches(GraphicsDevice gd, ref int drawCalls, ref int primitivesDrawn, ref int instancesDrawn)
         {
             RenderTargetModule targets = RenderManager.Targets;
             MaterialModule materials = RenderManager.Materials;
 
-            RenderTargetBinding[]? savedTargets = null;
+            RenderTargetScope offscreenScope = default;
             bool switchedOffscreen = false;
             int lastTargetId = -1;
             bool targetActive = false;
@@ -650,12 +648,17 @@ namespace Apotheosis.Runtime.Rendering.Commands
 
                             if (!switchedOffscreen)
                             {
-                                savedTargets = gd.GetRenderTargets();
+                                // 首次切入离屏时通过作用域栈保存原版绑定并切换目标
+                                offscreenScope = targets.Push(gd, resolvedRt);
                                 switchedOffscreen = true;
                             }
+                            else
+                            {
+                                gd.SetRenderTarget(resolvedRt);
+                                RenderManager.InvalidateViewContext();
+                            }
 
-                            gd.SetRenderTarget(resolvedRt);
-                            RenderManager.InvalidateViewContext();
+                            targetObj.OnBound(gd);
                             lastStateMaterial = default;
                             lastHadWorldOverride = false;
                             lastTargetId = batch.Target.Id;
@@ -665,9 +668,9 @@ namespace Apotheosis.Runtime.Rendering.Commands
                         {
                             if (prevSwitched)
                             {
-                                RestoreTargets(gd, savedTargets);
+                                offscreenScope.Dispose();
+                                offscreenScope = default;
                                 switchedOffscreen = false;
-                                RenderManager.InvalidateViewContext();
                                 lastStateMaterial = default;
                                 lastHadWorldOverride = false;
                             }
@@ -688,17 +691,10 @@ namespace Apotheosis.Runtime.Rendering.Commands
                     bool needApply = materialChanged || batch.HasWorldMatrix || lastHadWorldOverride;
                     if (needApply)
                     {
-                        ref readonly RenderFrameContext activeCtx = ref (switchedOffscreen ? ref RenderManager.FrameContextRef : ref initialContext);
-                        if (!mat.ApplyToGpu(
-                                gd,
-                                in activeCtx,
-                                applyPipelineStates: materialChanged,
-                                applyUniforms: materialChanged,
-                                batch.HasWorldMatrix,
-                                in batch.WorldMatrix))
-                        {
+                        // 始终走惰性缓存快路径，防止离屏切回主屏后读到过期上下文
+                        ref readonly RenderFrameContext activeCtx = ref RenderManager.FrameContextRef;
+                        if (!mat.ApplyToGpu(gd, in activeCtx, applyPipelineStates: materialChanged, applyUniforms: materialChanged, batch.HasWorldMatrix, in batch.WorldMatrix))
                             continue;
-                        }
 
                         lastStateMaterial = batch.Material;
                         lastHadWorldOverride = batch.HasWorldMatrix;
@@ -791,10 +787,7 @@ namespace Apotheosis.Runtime.Rendering.Commands
                 gd.Indices = null;
 
                 if (switchedOffscreen)
-                {
-                    RestoreTargets(gd, savedTargets);
-                    RenderManager.InvalidateViewContext();
-                }
+                    offscreenScope.Dispose();
 
                 Array.Clear(_batches, 0, _batchCount);
                 _batchCount = 0;
@@ -924,14 +917,6 @@ namespace Apotheosis.Runtime.Rendering.Commands
                 PrimitiveType.LineStrip => indexCount >= 2 ? indexCount - 1 : 0,
                 _ => 0,
             };
-        }
-
-        private static void RestoreTargets(GraphicsDevice gd, RenderTargetBinding[]? savedTargets)
-        {
-            if (savedTargets is null || savedTargets.Length == 0)
-                gd.SetRenderTarget(null);
-            else
-                gd.SetRenderTargets(savedTargets);
         }
     }
 }

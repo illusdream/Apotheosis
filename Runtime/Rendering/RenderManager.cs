@@ -3,13 +3,17 @@
 using System;
 using System.Runtime.CompilerServices;
 using System.Threading;
+using Apotheosis.Materials;
 using Apotheosis.Runtime.Rendering.Commands;
 using Apotheosis.Runtime.Rendering.Geometry;
 using Apotheosis.Runtime.Rendering.Materials;
+using Apotheosis.Runtime.Rendering.PostProcess;
 using Apotheosis.Runtime.Rendering.Shaders;
 using Apotheosis.Runtime.Rendering.Targets;
 using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics;
 using Terraria;
+using Terraria.Graphics.Effects;
 using Terraria.ModLoader;
 
 namespace Apotheosis.Runtime.Rendering
@@ -43,6 +47,9 @@ namespace Apotheosis.Runtime.Rendering
 
         /// <summary>渲染命令与合批调度模块。</summary>
         public static RenderCommandModule Commands { get; } = new();
+
+        /// <summary>后处理管线模块（选择性金字塔 Bloom、全屏 FP16 扭曲、Color Adjustments 与 Split Toning）。</summary>
+        public static PostProcessModule PostProcess { get; } = new();
 
         /// <summary>当前帧渲染上下文快照。</summary>
         public static RenderFrameContext FrameContext => FrameContextRef;
@@ -82,25 +89,41 @@ namespace Apotheosis.Runtime.Rendering
                 _lastDeltaTime = 0f;
                 _contextCaptured = false;
                 _frameContext = default;
-                Targets.ResetForLoad();
 #if DEBUG
                 Shaders.SetLogger(Mod.Logger);
+                Targets.SetLogger(Mod.Logger);
 #endif
+                Targets.ResetForLoad();
+                DistortionMaterials.Reset();
+                PostProcess.ResetForLoad();
             }
 
             if (!Main.dedServ)
             {
-                Main.RunOnMainThread(() => Shaders.EnsureMainThreadBound(Environment.CurrentManagedThreadId));
+                Main.RunOnMainThread(() =>
+                {
+                    Shaders.EnsureMainThreadBound(Environment.CurrentManagedThreadId);
+                    PostProcess.InitializeOnMainThread();
+                });
                 Main.OnPreDraw += OnPreDraw;
                 On_Main.DoDraw += Hook_DoDraw;
                 On_Main.DoDraw_UpdateCameraPosition += Hook_DoDraw_UpdateCameraPosition;
                 On_Main.DrawProjectiles += Hook_DrawProjectiles;
                 On_Main.DrawDust += Hook_DrawDust;
+                On_FilterManager.EndCapture_RenderTarget2D_RenderTarget2D_RenderTarget2D += Hook_FilterManager_EndCapture;
                 On_Main.DrawInterface += Hook_DrawInterface;
 #if DEBUG
                 _shaderHotReloader = ShaderHotReloader.TryStart(Shaders, Mod.Logger, Mod.Name);
 #endif
             }
+        }
+
+        public override bool RequiresScreenTarget()
+        {
+            if (Main.dedServ || _unloading)
+                return false;
+
+            return Main.gameMenu ? PostProcess.ShouldCaptureInMenu() : PostProcess.ShouldCaptureScreenTarget();
         }
 
         public override void PostDrawTiles()
@@ -120,6 +143,7 @@ namespace Apotheosis.Runtime.Rendering
                 On_Main.DoDraw_UpdateCameraPosition -= Hook_DoDraw_UpdateCameraPosition;
                 On_Main.DrawProjectiles -= Hook_DrawProjectiles;
                 On_Main.DrawDust -= Hook_DrawDust;
+                On_FilterManager.EndCapture_RenderTarget2D_RenderTarget2D_RenderTarget2D -= Hook_FilterManager_EndCapture;
                 On_Main.DrawInterface -= Hook_DrawInterface;
             }
 
@@ -129,9 +153,12 @@ namespace Apotheosis.Runtime.Rendering
                 _shaderHotReloader?.Dispose();
                 _shaderHotReloader = null;
                 Shaders.SetLogger(null);
+                Targets.SetLogger(null);
 #endif
 
                 // 按依赖严格逆序卸载各渲染子模块（所有 GPU Buffer/RT 均安全派发到主线程释放）
+                DistortionMaterials.Reset();
+                PostProcess.Unload();
                 Commands.Unload();
                 Meshes.Unload();
                 Materials.Unload();
@@ -192,6 +219,7 @@ namespace Apotheosis.Runtime.Rendering
                             Commands.EndFrame();
                             Meshes.EndFrame();
                             Materials.EndFrame();
+                            Targets.EndFrame();
                         }
                     }
                 }
@@ -201,6 +229,8 @@ namespace Apotheosis.Runtime.Rendering
         private static void Hook_DoDraw_UpdateCameraPosition(On_Main.orig_DoDraw_UpdateCameraPosition orig)
         {
             orig();
+            if (!_unloading && !Main.dedServ)
+                PostProcess.NotifyPreDrawViewEffects(Main.GameViewMatrix.Effects);
             FlushTimingSafe(RenderTiming.PreDrawOffscreen, invalidateAfter: true);
         }
 
@@ -215,6 +245,26 @@ namespace Apotheosis.Runtime.Rendering
         {
             orig(self);
             FlushTimingSafe(RenderTiming.AfterDust);
+        }
+
+        private static void Hook_FilterManager_EndCapture(On_FilterManager.orig_EndCapture_RenderTarget2D_RenderTarget2D_RenderTarget2D orig,
+            FilterManager self, RenderTarget2D finalTexture, RenderTarget2D screenTarget1, RenderTarget2D screenTarget2)
+        {
+            // 先让原版 EndCapture 完成 skyTarget + screenTarget 合成、原版滤镜、重力翻转并写入 Main.finalScreenTarget
+            orig(self, finalTexture, screenTarget1, screenTarget2);
+
+            if (!_unloading && !Main.dedServ)
+            {
+                GraphicsDevice? gd = Main.graphics?.GraphicsDevice;
+                if (gd is { IsDisposed: false })
+                {
+                    lock (_lifecycleLock)
+                    {
+                        if (!_unloading)
+                            PostProcess.ExecuteAfterEndCapture(gd, finalTexture);
+                    }
+                }
+            }
         }
 
         private static void Hook_DrawInterface(On_Main.orig_DrawInterface orig, Main self, GameTime gameTime)

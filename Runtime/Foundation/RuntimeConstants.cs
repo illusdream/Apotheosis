@@ -29,5 +29,11 @@ namespace Apotheosis.Runtime.Foundation
         /// 有符号 0-based 数组的通用无效索引（<c>-1</c>），例如泰拉瑞亚实体 <c>whoAmI</c>。
         /// </summary>
         public const int InvalidIndex = -1;
+
+        /// <summary>2D/3D 正交投影的默认近裁剪面深度（<c>-10000f</c>）。</summary>
+        public const float OrthoNearPlane = -10000f;
+
+        /// <summary>2D/3D 正交投影的默认远裁剪面深度（<c>10000f</c>）。</summary>
+        public const float OrthoFarPlane = 10000f;
     }
 }

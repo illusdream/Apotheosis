@@ -206,6 +206,16 @@ namespace Apotheosis.Runtime.Rendering.Materials
             }
         }
 
+        internal MaterialHandle CreateProtected(ShaderHandle shader, int techniqueIndex = 0, int passIndex = 0,
+            BlendState? blendState = null, DepthStencilState? depthStencilState = null,
+            RasterizerState? rasterizerState = null, SamplerState? sampler0 = null, bool fallbackToMagicPixel = false)
+        {
+            lock (_lock)
+            {
+                return CreateLocked(shader, techniqueIndex, passIndex, blendState, depthStencilState, rasterizerState, sampler0, fallbackToMagicPixel, protectFromExternalRelease: true);
+            }
+        }
+
         /// <summary>获取或创建指定贴图与采样/混合状态对应的 2D 精灵材质。</summary>
         public MaterialHandle GetOrCreateSpriteMaterial(Texture2D texture, BlendState? blendState = null, SamplerState? samplerState = null)
         {

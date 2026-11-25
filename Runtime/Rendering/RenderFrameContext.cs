@@ -1,5 +1,6 @@
 #nullable enable
 
+using Apotheosis.Runtime.Foundation;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Terraria;
@@ -59,13 +60,19 @@ namespace Apotheosis.Runtime.Rendering
             int width = viewport.Width > 0 ? viewport.Width : (Main.screenWidth > 0 ? Main.screenWidth : 1);
             int height = viewport.Height > 0 ? viewport.Height : (Main.screenHeight > 0 ? Main.screenHeight : 1);
 
+            int logicalWidth = Main.screenWidth > 0 ? Main.screenWidth : width;
+            int logicalHeight = Main.screenHeight > 0 ? Main.screenHeight : height;
+
             var resolution = new Vector2(width, height);
             Vector2 zoom = viewMatrix.Zoom;
             Matrix viewTransform = viewMatrix.TransformationMatrix;
 
-            // 宽深度正交投影 [-10000..10000]，确保 3D 旋转网格与 depthZ 偏移不被近/远裁剪面裁切
-            Matrix projection = Matrix.CreateOrthographicOffCenter(0f, width, height, 0f, -10000f, 10000f);
-            Matrix spriteTransform = viewTransform * projection;
+            // 宽深度正交投影；世界/精灵矩阵按逻辑屏幕尺寸投影，保证非 1:1 比例离屏 RT 与主屏 1:1 对齐
+            Matrix projection = Matrix.CreateOrthographicOffCenter(0f, width, height, 0f, RuntimeConstants.OrthoNearPlane, RuntimeConstants.OrthoFarPlane);
+            Matrix logicalProjection = (logicalWidth == width && logicalHeight == height)
+                ? projection
+                : Matrix.CreateOrthographicOffCenter(0f, logicalWidth, logicalHeight, 0f, RuntimeConstants.OrthoNearPlane, RuntimeConstants.OrthoFarPlane);
+            Matrix spriteTransform = viewTransform * logicalProjection;
             Matrix worldTransform = Matrix.CreateTranslation(-Main.screenPosition.X, -Main.screenPosition.Y, 0f) * spriteTransform;
 
             return new RenderFrameContext(frameId, contextRevision, Main.GlobalTimeWrappedHourly, deltaTime,
