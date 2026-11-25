@@ -2,7 +2,6 @@
 
 using System;
 using Microsoft.Xna.Framework.Graphics;
-using Terraria;
 
 namespace Apotheosis.Runtime.Rendering.Targets
 {
@@ -94,7 +93,7 @@ namespace Apotheosis.Runtime.Rendering.Targets
                 if (_disposed || RenderManager.IsUnloading)
                     return null;
 
-                if (_target is not null && !_target.IsDisposed && _currentKey == desiredKey)
+                if (_target is not null && !_target.IsDisposed && ReferenceEquals(_target.GraphicsDevice, graphicsDevice) && _currentKey == desiredKey)
                 {
                     if (_target.IsContentLost)
                         _needsRedraw = true;
@@ -112,7 +111,7 @@ namespace Apotheosis.Runtime.Rendering.Targets
             {
                 if (_disposed || RenderManager.IsUnloading)
                 {
-                    newRt.Dispose();
+                    GpuResourceHelper.DisposeSafe(newRt);
                     return null;
                 }
 
@@ -124,8 +123,7 @@ namespace Apotheosis.Runtime.Rendering.Targets
                 _needsRedraw = true;
             }
 
-            if (oldTarget is not null && !oldTarget.IsDisposed)
-                oldTarget.Dispose();
+            GpuResourceHelper.DisposeSafe(oldTarget);
 
             if (wasRebuild)
                 _owner.NotifyPersistentRebuilt();
@@ -167,13 +165,7 @@ namespace Apotheosis.Runtime.Rendering.Targets
                 _target = null;
             }
 
-            if (toDispose is null || toDispose.IsDisposed)
-                return;
-
-            if (RenderManager.Shaders.IsOnMainThread)
-                toDispose.Dispose();
-            else
-                Main.QueueMainThreadAction(() => { if (!toDispose.IsDisposed) toDispose.Dispose(); });
+            GpuResourceHelper.DisposeOnMainThread(toDispose);
         }
     }
 }

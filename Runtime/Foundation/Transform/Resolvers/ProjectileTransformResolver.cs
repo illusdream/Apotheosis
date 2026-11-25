@@ -1,7 +1,5 @@
 #nullable enable
 
-using System;
-using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Terraria;
 
@@ -20,39 +18,12 @@ namespace Apotheosis.Runtime.Foundation.Transform.Resolvers
 
         public override void ReadFrom(TransformNode node, Projectile target, TransformSyncFlags flags = TransformSyncFlags.All)
         {
-            if ((flags & TransformSyncFlags.Position) != 0)
-            {
-                node.WorldPosition = new Vector3(target.Center, node.WorldPosition.Z);
-            }
-
-            if ((flags & TransformSyncFlags.Rotation) != 0)
-            {
-                node.WorldRotation = Quaternion.CreateFromAxisAngle(Vector3.UnitZ, target.rotation);
-            }
-
-            if ((flags & TransformSyncFlags.Scale) != 0)
-            {
-                float mag = MathF.Abs(target.scale);
-                Vector3 parentScale = node.Parent?.WorldScale ?? Vector3.One;
-                float localMagX = MathF.Abs(parentScale.X) > 1e-6f ? mag / MathF.Abs(parentScale.X) : mag;
-                float localMagY = MathF.Abs(parentScale.Y) > 1e-6f ? mag / MathF.Abs(parentScale.Y) : mag;
-                Vector3 current = node.LocalScale;
-                node.LocalScale = new Vector3(
-                    current.X < 0f ? -localMagX : localMagX,
-                    current.Y < 0f ? -localMagY : localMagY,
-                    current.Z);
-            }
-
-            if ((flags & TransformSyncFlags.Facing) != 0)
-            {
-                int dir = target.spriteDirection != 0 ? target.spriteDirection : target.direction;
-                if (dir != 0)
-                {
-                    Vector3 parentSign = node.Parent?.WorldScaleSign ?? Vector3.One;
-                    node.SetFlipX((dir < 0) ^ (parentSign.X < 0f));
-                    node.SetFlipY(parentSign.Y < 0f);
-                }
-            }
+            int dir = target.spriteDirection != 0 ? target.spriteDirection : target.direction;
+            bool setFlip = (flags & TransformSyncFlags.Facing) != 0 && dir != 0;
+            node.ApplyWorld2DSync((flags & TransformSyncFlags.Position) != 0, target.Center,
+                (flags & TransformSyncFlags.Rotation) != 0, target.rotation,
+                (flags & TransformSyncFlags.Scale) != 0, target.scale,
+                setFlip, flipX: dir < 0, flipY: false);
         }
 
         public override void WriteTo(TransformNode node, Projectile target, TransformSyncFlags flags = TransformSyncFlags.All)

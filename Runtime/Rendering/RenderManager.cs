@@ -3,7 +3,6 @@
 using System;
 using System.Runtime.CompilerServices;
 using System.Threading;
-using Apotheosis.Materials;
 using Apotheosis.Runtime.Rendering.Commands;
 using Apotheosis.Runtime.Rendering.Geometry;
 using Apotheosis.Runtime.Rendering.Materials;
@@ -94,7 +93,6 @@ namespace Apotheosis.Runtime.Rendering
                 Targets.SetLogger(Mod.Logger);
 #endif
                 Targets.ResetForLoad();
-                DistortionMaterials.Reset();
                 PostProcess.ResetForLoad();
             }
 
@@ -157,7 +155,6 @@ namespace Apotheosis.Runtime.Rendering
 #endif
 
                 // 按依赖严格逆序卸载各渲染子模块（所有 GPU Buffer/RT 均安全派发到主线程释放）
-                DistortionMaterials.Reset();
                 PostProcess.Unload();
                 Commands.Unload();
                 Meshes.Unload();

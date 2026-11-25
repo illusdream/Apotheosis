@@ -1,118 +1,125 @@
 #nullable enable
 
 using System.Collections.Generic;
+using Apotheosis.Runtime.Foundation.Collections;
 using Apotheosis.Runtime.Foundation.Transform.Bindings;
 using Apotheosis.Runtime.Foundation.Transform.Pooling;
 using Terraria.ModLoader;
 
 namespace Apotheosis.Runtime.Foundation.Transform
 {
-    /// <summary>
-    /// 全局 3D 变换层级托管系统：负责每帧检测失活实体并级联清理子树、按 <c>Pull → Push</c> 顺序同步绑定节点，
-    /// 以及在世界/模组卸载时清空全部节点池与绑定池。
-    /// </summary>
+    /// <summary>全局 3D 变换层级托管系统。</summary>
     public sealed class TransformWorldSystem : ModSystem
     {
-        private static readonly List<TransformNode> _managedNodes = new();
+        private static readonly object _sync = new();
+        private static readonly IndexedSwapList<TransformNode> _managedNodes = new(64);
         private static readonly List<TransformNode> _iterationBuffer = new();
+        private static readonly List<TransformNode> _pullBuffer = new();
         private static readonly List<TransformNode> _pushBuffer = new();
+        private static volatile bool _unloading;
 
         /// <summary>当前已注册托管的活跃节点数量。</summary>
-        public static int ManagedCount => _managedNodes.Count;
+        public static int ManagedCount { get { lock (_sync) return _managedNodes.Count; } }
 
-        /// <summary>将节点注册到世界托管同步队列。</summary>
+        /// <summary>将节点注册到世界托管同步队列（O(1)）。</summary>
         public static void Register(TransformNode node)
         {
-            if (node.IsDisposed || node.IsRegisteredInWorld)
+            if (_unloading || node.IsDisposed)
                 return;
 
-            node.IsRegisteredInWorld = true;
-            _managedNodes.Add(node);
+            lock (_sync)
+            {
+                if (!_unloading && !node.IsDisposed)
+                    _managedNodes.Add(node);
+            }
         }
 
-        /// <summary>将节点从世界托管同步队列移除（O(1) Swap-Remove）。</summary>
+        /// <summary>将节点从世界托管同步队列移除（O(1) 侵入式 Swap-Remove）。</summary>
         public static void Unregister(TransformNode node)
         {
-            if (!node.IsRegisteredInWorld)
-                return;
+            lock (_sync)
+                _managedNodes.Remove(node);
+        }
 
-            node.IsRegisteredInWorld = false;
-            int index = _managedNodes.IndexOf(node);
-            if (index >= 0)
-            {
-                int last = _managedNodes.Count - 1;
-                if (index != last)
-                {
-                    _managedNodes[index] = _managedNodes[last];
-                }
-
-                _managedNodes.RemoveAt(last);
-            }
+        public override void Load()
+        {
+            _unloading = false;
         }
 
         public override void PostUpdateEverything()
         {
-            if (_managedNodes.Count == 0)
+            if (_unloading)
                 return;
 
-            // 1. 失活检测与级联清理（复用的遍历缓冲避免 Cleanup 修改集合引发异常）
-            SnapshotManagedNodes();
-            for (int i = 0; i < _iterationBuffer.Count; i++)
+            try
             {
-                TransformNode node = _iterationBuffer[i];
-                if (node.IsDisposed)
-                    continue;
+                // 1. 失活检测与级联清理（复用的遍历缓冲避免 Cleanup 修改集合引发异常）
+                if (!SnapshotManagedNodes(_iterationBuffer))
+                    return;
 
-                ITransformBinding? binding = node.Binding;
-                if (binding is not null && !binding.IsAlive)
+                for (int i = 0; i < _iterationBuffer.Count; i++)
                 {
-                    node.Cleanup(TransformCleanupReason.TargetDestroyed);
+                    TransformNode node = _iterationBuffer[i];
+                    if (node.IsDisposed)
+                        continue;
+
+                    ITransformBinding? binding = node.Binding;
+                    if (binding is not null && !binding.IsAlive)
+                        node.Cleanup(TransformCleanupReason.TargetDestroyed);
+                }
+
+                // 2. 分流 Pull / Push 节点
+                if (!SnapshotManagedNodes(_iterationBuffer))
+                    return;
+
+                bool pullHasHierarchy = false;
+                for (int i = 0; i < _iterationBuffer.Count; i++)
+                {
+                    TransformNode node = _iterationBuffer[i];
+                    if (node.IsDisposed || node.Binding is null)
+                        continue;
+
+                    switch (node.Binding.SyncMode)
+                    {
+                        case TransformSyncMode.Pull:
+                            _pullBuffer.Add(node);
+                            if (node.Depth > 0)
+                                pullHasHierarchy = true;
+                            break;
+                        case TransformSyncMode.Push:
+                            _pushBuffer.Add(node);
+                            break;
+                    }
+                }
+
+                // Pull 阶段：存在父子嵌套时按 Depth 升序，避免子节点基于父节点旧帧矩阵反算局部变换
+                if (pullHasHierarchy && _pullBuffer.Count > 1)
+                    _pullBuffer.Sort(static (a, b) => a.Depth.CompareTo(b.Depth));
+
+                for (int i = 0; i < _pullBuffer.Count; i++)
+                {
+                    TransformNode node = _pullBuffer[i];
+                    if (!node.IsDisposed)
+                        node.SyncFromTarget();
+                }
+
+                // 3. Push 阶段：按层级深度从父到子将世界变换写回受控实体
+                if (_pushBuffer.Count > 1)
+                    _pushBuffer.Sort(static (a, b) => a.Depth.CompareTo(b.Depth));
+
+                for (int i = 0; i < _pushBuffer.Count; i++)
+                {
+                    TransformNode node = _pushBuffer[i];
+                    if (!node.IsDisposed)
+                        node.ApplyToTarget();
                 }
             }
-
-            if (_managedNodes.Count == 0)
+            finally
             {
                 _iterationBuffer.Clear();
-                return;
+                _pullBuffer.Clear();
+                _pushBuffer.Clear();
             }
-
-            // 2. Pull 阶段：先从宿主实体（如 Player / 原版 NPC）拉取本帧最新空间状态
-            _pushBuffer.Clear();
-            SnapshotManagedNodes();
-            for (int i = 0; i < _iterationBuffer.Count; i++)
-            {
-                TransformNode node = _iterationBuffer[i];
-                if (node.IsDisposed || node.Binding is null)
-                    continue;
-
-                switch (node.Binding.SyncMode)
-                {
-                    case TransformSyncMode.Pull:
-                        node.SyncFromTarget();
-                        break;
-                    case TransformSyncMode.Push:
-                        _pushBuffer.Add(node);
-                        break;
-                }
-            }
-
-            // 3. Push 阶段：按层级深度从父到子将世界变换写回受控实体
-            if (_pushBuffer.Count > 1)
-            {
-                _pushBuffer.Sort(static (a, b) => a.Depth.CompareTo(b.Depth));
-            }
-
-            for (int i = 0; i < _pushBuffer.Count; i++)
-            {
-                TransformNode node = _pushBuffer[i];
-                if (!node.IsDisposed)
-                {
-                    node.ApplyToTarget();
-                }
-            }
-
-            _iterationBuffer.Clear();
-            _pushBuffer.Clear();
         }
 
         public override void OnWorldUnload()
@@ -122,39 +129,43 @@ namespace Apotheosis.Runtime.Foundation.Transform
 
         public override void Unload()
         {
+            _unloading = true;
             CleanupAllManaged(TransformCleanupReason.WorldUnload);
             TransformNodePool.ClearAll();
             TransformBindingPools.ClearAll();
         }
 
-        private static void SnapshotManagedNodes()
+        private static bool SnapshotManagedNodes(List<TransformNode> destination)
         {
-            _iterationBuffer.Clear();
-            _iterationBuffer.AddRange(_managedNodes);
+            lock (_sync)
+            {
+                if (_managedNodes.Count == 0)
+                {
+                    destination.Clear();
+                    return false;
+                }
+
+                _managedNodes.CopyTo(destination);
+                return true;
+            }
         }
 
         private static void CleanupAllManaged(TransformCleanupReason reason)
         {
-            if (_managedNodes.Count == 0)
-            {
-                _iterationBuffer.Clear();
-                _pushBuffer.Clear();
+            // 使用局部快照，避免与主线程 PostUpdateEverything 争用静态 _iterationBuffer
+            List<TransformNode> snapshot = new();
+            if (!SnapshotManagedNodes(snapshot))
                 return;
-            }
 
-            SnapshotManagedNodes();
-            for (int i = 0; i < _iterationBuffer.Count; i++)
+            for (int i = 0; i < snapshot.Count; i++)
             {
-                TransformNode node = _iterationBuffer[i];
+                TransformNode node = snapshot[i];
                 if (!node.IsDisposed)
-                {
                     node.Cleanup(reason);
-                }
             }
 
-            _managedNodes.Clear();
-            _iterationBuffer.Clear();
-            _pushBuffer.Clear();
+            lock (_sync)
+                _managedNodes.Clear();
         }
     }
 }

@@ -4,6 +4,8 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using Apotheosis.Runtime.Foundation.Collections;
+using Apotheosis.Runtime.Rendering;
 using Hexa.NET.ImGui;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
@@ -11,13 +13,7 @@ using Terraria.ModLoader;
 
 namespace Apotheosis.DebugTool.Renderer
 {
-    /// <summary>
-    /// 基于 tModLoader 原版 FNA (<see cref="GraphicsDevice"/> + <see cref="BasicEffect"/>) 的 Dear ImGui 1.92 渲染后端。
-    /// <para>
-    /// 支持动态字体与纹理更新（<see cref="ImGuiBackendFlags.RendererHasTextures"/>）以及大网格顶点偏移
-    /// （<see cref="ImGuiBackendFlags.RendererHasVtxOffset"/>）。
-    /// </para>
-    /// </summary>
+    /// <summary>基于 tModLoader 原版 FNA 的 Dear ImGui 1.92 渲染后端。</summary>
     [NoJIT]
     internal sealed unsafe class FnaImGuiRenderer : IDisposable
     {
@@ -28,13 +24,11 @@ namespace Apotheosis.DebugTool.Renderer
         private readonly Dictionary<ulong, Texture2D> _textures = new();
         private ulong _nextTextureId = 1;
 
-        private VertexBuffer? _vertexBuffer;
-        private int _vertexBufferSize;
-        private ImGuiVertex[] _vertexStaging = Array.Empty<ImGuiVertex>();
+        private readonly DynamicGpuVertexBuffer<ImGuiVertex> _vertexBuffer = new(ImGuiVertex.Declaration, minCapacity: 2048);
+        private ValueBuffer<ImGuiVertex> _vertexStaging = new(initialCapacity: 0, defaultGrowCapacity: 2048);
 
-        private IndexBuffer? _indexBuffer;
-        private int _indexBufferSize;
-        private ushort[] _indexStaging = Array.Empty<ushort>();
+        private readonly DynamicGpuIndexBuffer<ushort> _indexBuffer = new(IndexElementSize.SixteenBits, minCapacity: 4096);
+        private ValueBuffer<ushort> _indexStaging = new(initialCapacity: 0, defaultGrowCapacity: 4096);
 
         private byte[] _pixelUploadBuffer = Array.Empty<byte>();
         private bool _disposed;
@@ -121,8 +115,8 @@ namespace Apotheosis.DebugTool.Renderer
                     -1f,
                     1f);
 
-                _graphicsDevice.SetVertexBuffer(_vertexBuffer);
-                _graphicsDevice.Indices = _indexBuffer;
+                _graphicsDevice.SetVertexBuffer(_vertexBuffer.Buffer);
+                _graphicsDevice.Indices = _indexBuffer.Buffer;
 
                 System.Numerics.Vector2 clipOff = drawData.DisplayPos;
                 System.Numerics.Vector2 clipScale = drawData.FramebufferScale;
@@ -360,35 +354,14 @@ namespace Apotheosis.DebugTool.Renderer
             int totalVtx = drawData.TotalVtxCount;
             int totalIdx = drawData.TotalIdxCount;
 
-            if (_vertexBuffer is null || _vertexBuffer.IsDisposed || totalVtx > _vertexBufferSize)
-            {
-                _vertexBuffer?.Dispose();
-                _vertexBufferSize = Math.Max(totalVtx + 2048, (int)(_vertexBufferSize * 1.5f));
-                _vertexBuffer = new DynamicVertexBuffer(
-                    _graphicsDevice,
-                    ImGuiVertex.Declaration,
-                    _vertexBufferSize,
-                    BufferUsage.WriteOnly);
-                _vertexStaging = new ImGuiVertex[_vertexBufferSize];
-            }
-
-            if (_indexBuffer is null || _indexBuffer.IsDisposed || totalIdx > _indexBufferSize)
-            {
-                _indexBuffer?.Dispose();
-                _indexBufferSize = Math.Max(totalIdx + 4096, (int)(_indexBufferSize * 1.5f));
-                _indexBuffer = new DynamicIndexBuffer(
-                    _graphicsDevice,
-                    IndexElementSize.SixteenBits,
-                    _indexBufferSize,
-                    BufferUsage.WriteOnly);
-                _indexStaging = new ushort[_indexBufferSize];
-            }
+            _vertexStaging.EnsureCapacity(totalVtx);
+            _indexStaging.EnsureCapacity(totalIdx);
 
             int vtxCursor = 0;
             int idxCursor = 0;
 
-            fixed (ImGuiVertex* dstVtx = _vertexStaging)
-            fixed (ushort* dstIdx = _indexStaging)
+            fixed (ImGuiVertex* dstVtx = _vertexStaging.RawArray)
+            fixed (ushort* dstIdx = _indexStaging.RawArray)
             {
                 for (int n = 0; n < drawData.CmdListsCount; n++)
                 {
@@ -398,11 +371,7 @@ namespace Apotheosis.DebugTool.Renderer
                     if (vtxCount > 0)
                     {
                         long vtxBytes = (long)vtxCount * ImGuiVertex.SizeInBytes;
-                        Buffer.MemoryCopy(
-                            cmdList.VtxBuffer.Data,
-                            dstVtx + vtxCursor,
-                            vtxBytes,
-                            vtxBytes);
+                        Buffer.MemoryCopy(cmdList.VtxBuffer.Data, dstVtx + vtxCursor, vtxBytes, vtxBytes);
                         vtxCursor += vtxCount;
                     }
 
@@ -410,30 +379,14 @@ namespace Apotheosis.DebugTool.Renderer
                     if (idxCount > 0)
                     {
                         long idxBytes = (long)idxCount * sizeof(ushort);
-                        Buffer.MemoryCopy(
-                            cmdList.IdxBuffer.Data,
-                            dstIdx + idxCursor,
-                            idxBytes,
-                            idxBytes);
+                        Buffer.MemoryCopy(cmdList.IdxBuffer.Data, dstIdx + idxCursor, idxBytes, idxBytes);
                         idxCursor += idxCount;
                     }
                 }
             }
 
-            ((DynamicVertexBuffer)_vertexBuffer).SetData(
-                0,
-                _vertexStaging,
-                0,
-                vtxCursor,
-                ImGuiVertex.SizeInBytes,
-                SetDataOptions.Discard);
-
-            ((DynamicIndexBuffer)_indexBuffer).SetData(
-                0,
-                _indexStaging,
-                0,
-                idxCursor,
-                SetDataOptions.Discard);
+            _vertexBuffer.UploadDiscard(_graphicsDevice, _vertexStaging.RawArray, vtxCursor, ImGuiVertex.SizeInBytes);
+            _indexBuffer.UploadDiscard(_graphicsDevice, _indexStaging.RawArray, idxCursor);
         }
 
         public void Dispose()
@@ -451,11 +404,8 @@ namespace Apotheosis.DebugTool.Renderer
 
             _textures.Clear();
 
-            _vertexBuffer?.Dispose();
-            _vertexBuffer = null;
-
-            _indexBuffer?.Dispose();
-            _indexBuffer = null;
+            _vertexBuffer.DisposeImmediate();
+            _indexBuffer.DisposeImmediate();
 
             _effect.Dispose();
             _rasterizerState.Dispose();

@@ -147,7 +147,16 @@ namespace Apotheosis.Runtime.Rendering.Geometry
         public static void AddTrailRibbon(this DynamicMesh mesh, ReadOnlySpan<Vector2> points, float startWidth, float endWidth,
             Color startColor, Color endColor, Func<float, float>? widthCurve = null, Func<float, Color>? colorCurve = null, float depthZ = 0f)
         {
-            int count = points.Length;
+            AddTrailRibbon(mesh, points, ReadOnlySpan<Vector2>.Empty, startWidth, endWidth, startColor, endColor, widthCurve, colorCurve, depthZ);
+        }
+
+        /// <summary>从两段连续点列（如环形缓冲分片）零拷贝追加一条 2D 丝带拖尾。</summary>
+        internal static void AddTrailRibbon(this DynamicMesh mesh, ReadOnlySpan<Vector2> first, ReadOnlySpan<Vector2> second,
+            float startWidth, float endWidth, Color startColor, Color endColor,
+            Func<float, float>? widthCurve = null, Func<float, Color>? colorCurve = null, float depthZ = 0f)
+        {
+            int firstLen = first.Length;
+            int count = firstLen + second.Length;
             if (count < 2)
                 return;
 
@@ -160,13 +169,27 @@ namespace Apotheosis.Runtime.Rendering.Geometry
             for (int i = 0; i < count; i++)
             {
                 float t = i * invSpan;
+                Vector2 p = i < firstLen ? first[i] : second[i - firstLen];
                 Vector2 dir;
                 if (i == 0)
-                    dir = points[1] - points[0];
+                {
+                    Vector2 pNext = 1 < firstLen ? first[1] : second[1 - firstLen];
+                    dir = pNext - p;
+                }
                 else if (i == count - 1)
-                    dir = points[count - 1] - points[count - 2];
+                {
+                    int prevIdx = count - 2;
+                    Vector2 pPrev = prevIdx < firstLen ? first[prevIdx] : second[prevIdx - firstLen];
+                    dir = p - pPrev;
+                }
                 else
-                    dir = points[i + 1] - points[i - 1];
+                {
+                    int nextIdx = i + 1;
+                    int prevIdx = i - 1;
+                    Vector2 pNext = nextIdx < firstLen ? first[nextIdx] : second[nextIdx - firstLen];
+                    Vector2 pPrev = prevIdx < firstLen ? first[prevIdx] : second[prevIdx - firstLen];
+                    dir = pNext - pPrev;
+                }
 
                 float lenSq = dir.LengthSquared();
                 if (lenSq > 1e-6f)
@@ -182,8 +205,6 @@ namespace Apotheosis.Runtime.Rendering.Geometry
                 float width = widthCurve is not null ? widthCurve(t) : MathHelper.Lerp(startWidth, endWidth, t);
                 Color color = colorCurve is not null ? colorCurve(t) : Color.Lerp(startColor, endColor, t);
                 Vector2 perp = new Vector2(-dir.Y, dir.X) * (width * 0.5f);
-
-                Vector2 p = points[i];
                 Vector4 custom = new(t, width, 0f, 0f);
 
                 int vIdx = i * 2;

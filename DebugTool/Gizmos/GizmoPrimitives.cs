@@ -6,12 +6,10 @@ using Microsoft.Xna.Framework;
 
 namespace Apotheosis.DebugTool.Gizmos
 {
-    /// <summary>
-    /// 全部底层原语共享的样式与生命周期元数据头。
-    /// </summary>
+    /// <summary>全部底层原语共享的样式与生命周期元数据头。</summary>
     internal struct GizmoMeta
     {
-        public string Channel;
+        public ushort ChannelId;
         public Color Color;
         public float Thickness;
         public float RemainingDuration;

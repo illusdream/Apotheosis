@@ -1,6 +1,5 @@
 #nullable enable
 
-using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Terraria;
 
@@ -19,22 +18,10 @@ namespace Apotheosis.Runtime.Foundation.Transform.Resolvers
 
         public override void ReadFrom(TransformNode node, Player target, TransformSyncFlags flags = TransformSyncFlags.All)
         {
-            if ((flags & TransformSyncFlags.Position) != 0)
-            {
-                node.WorldPosition = new Vector3(target.Center, node.WorldPosition.Z);
-            }
-
-            if ((flags & TransformSyncFlags.Rotation) != 0)
-            {
-                node.WorldRotation = Quaternion.CreateFromAxisAngle(Vector3.UnitZ, target.fullRotation);
-            }
-
-            if ((flags & TransformSyncFlags.Facing) != 0)
-            {
-                Vector3 parentSign = node.Parent?.WorldScaleSign ?? Vector3.One;
-                node.SetFlipX((target.direction < 0) ^ (parentSign.X < 0f));
-                node.SetFlipY((target.gravDir < 0f) ^ (parentSign.Y < 0f));
-            }
+            node.ApplyWorld2DSync((flags & TransformSyncFlags.Position) != 0, target.Center,
+                (flags & TransformSyncFlags.Rotation) != 0, target.fullRotation,
+                setUniformScale: false, uniformScale: 1f,
+                (flags & TransformSyncFlags.Facing) != 0, flipX: target.direction < 0, flipY: target.gravDir < 0f);
         }
 
         public override void WriteTo(TransformNode node, Player target, TransformSyncFlags flags = TransformSyncFlags.All)

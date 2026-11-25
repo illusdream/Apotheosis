@@ -1,7 +1,5 @@
 #nullable enable
 
-using System;
-using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Terraria;
 
@@ -20,30 +18,11 @@ namespace Apotheosis.Runtime.Foundation.Transform.Resolvers
 
         public override void ReadFrom(TransformNode node, WorldItem target, TransformSyncFlags flags = TransformSyncFlags.All)
         {
-            if ((flags & TransformSyncFlags.Position) != 0)
-            {
-                node.WorldPosition = new Vector3(target.Center, node.WorldPosition.Z);
-            }
-
-            if ((flags & TransformSyncFlags.Scale) != 0)
-            {
-                float mag = MathF.Abs(target.scale);
-                Vector3 parentScale = node.Parent?.WorldScale ?? Vector3.One;
-                float localMagX = MathF.Abs(parentScale.X) > 1e-6f ? mag / MathF.Abs(parentScale.X) : mag;
-                float localMagY = MathF.Abs(parentScale.Y) > 1e-6f ? mag / MathF.Abs(parentScale.Y) : mag;
-                Vector3 current = node.LocalScale;
-                node.LocalScale = new Vector3(
-                    current.X < 0f ? -localMagX : localMagX,
-                    current.Y < 0f ? -localMagY : localMagY,
-                    current.Z);
-            }
-
-            if ((flags & TransformSyncFlags.Facing) != 0 && target.direction != 0)
-            {
-                Vector3 parentSign = node.Parent?.WorldScaleSign ?? Vector3.One;
-                node.SetFlipX((target.direction < 0) ^ (parentSign.X < 0f));
-                node.SetFlipY(parentSign.Y < 0f);
-            }
+            bool setFlip = (flags & TransformSyncFlags.Facing) != 0 && target.direction != 0;
+            node.ApplyWorld2DSync((flags & TransformSyncFlags.Position) != 0, target.Center,
+                setRotation: false, worldRotationZ: 0f,
+                (flags & TransformSyncFlags.Scale) != 0, target.scale,
+                setFlip, flipX: target.direction < 0, flipY: false);
         }
 
         public override void WriteTo(TransformNode node, WorldItem target, TransformSyncFlags flags = TransformSyncFlags.All)

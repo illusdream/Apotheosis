@@ -1,5 +1,7 @@
 #nullable enable
 
+using Apotheosis.Runtime.Foundation;
+using Apotheosis.Runtime.Foundation.Collections;
 using Microsoft.Xna.Framework.Graphics;
 
 namespace Apotheosis.Runtime.Rendering.Targets
@@ -11,20 +13,22 @@ namespace Apotheosis.Runtime.Rendering.Targets
     }
 
     /// <summary>RT 池物理条目内部节点。</summary>
-    internal sealed class PooledEntry
+    internal sealed class PooledEntry : IIndexedSwapItem
     {
         public readonly RenderTargetPoolKey Key;
         public readonly RenderTarget2D Target;
         public readonly long EstimatedBytes;
         public bool IsScreenRelative;
         public int LeaseToken;
-        public int ActiveIndex = -1;
+        public int ActiveIndex = RuntimeConstants.InvalidIndex;
         public int ResolutionEpoch;
         public ulong LastReturnedFrame;
         public ulong LeasedFrame;
         public bool InUse;
         public bool IsTransientLease;
         public bool IsDisposed;
+
+        int IIndexedSwapItem.SwapListIndex { get => ActiveIndex; set => ActiveIndex = value; }
 
         public PooledEntry(RenderTargetPoolKey key, RenderTarget2D target, bool isScreenRelative)
         {

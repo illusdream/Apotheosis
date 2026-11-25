@@ -1,6 +1,8 @@
 #nullable enable
 
 using System;
+using System.Threading;
+using Apotheosis.Runtime.Foundation.Collections;
 using Apotheosis.Runtime.Rendering.Shaders;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
@@ -11,6 +13,8 @@ namespace Apotheosis.Runtime.Rendering.Materials
     /// <summary>受管材质实例，封装着色器、GPU 管线状态及槽位化参数表。</summary>
     public sealed class ManagedMaterial
     {
+        private static int _nextLockOrder;
+
         private enum ParamKind : byte
         {
             None = 0,
@@ -39,9 +43,9 @@ namespace Apotheosis.Runtime.Rendering.Materials
             public object? RefValue;  // 存 Texture / float[] / Vector2[] / Vector3[] / Vector4[] / Matrix[]
         }
 
+        private readonly int _lockOrder = Interlocked.Increment(ref _nextLockOrder);
         private readonly object _paramLock = new();
-        private ParamEntry[] _params = Array.Empty<ParamEntry>();
-        private int _paramCount;
+        private ValueBuffer<ParamEntry> _params = new(initialCapacity: 0, defaultGrowCapacity: 4);
 
         public MaterialHandle Handle { get; internal set; }
         public ShaderHandle Shader { get; set; }
@@ -82,28 +86,46 @@ namespace Apotheosis.Runtime.Rendering.Materials
                 Sampler3 = null;
                 FallbackToMagicPixel = fallbackToMagicPixel;
                 PrimaryTextureSlot = 0;
+                _params.Clear(clearReferences: true);
+            }
+        }
 
-                if (_paramCount > 0)
-                {
-                    Array.Clear(_params, 0, _paramCount);
-                    _paramCount = 0;
-                }
+        internal void ClearForPool()
+        {
+            lock (_paramLock)
+            {
+                Handle = MaterialHandle.Invalid;
+                Shader = default;
+                TechniqueIndex = 0;
+                PassIndex = 0;
+                BlendState = BlendState.AlphaBlend;
+                DepthStencilState = DepthStencilState.None;
+                RasterizerState = RasterizerState.CullNone;
+                Sampler0 = SamplerState.LinearClamp;
+                Sampler1 = null;
+                Sampler2 = null;
+                Sampler3 = null;
+                FallbackToMagicPixel = false;
+                PrimaryTextureSlot = 0;
+                _params.Clear(clearReferences: true);
             }
         }
 
         internal void CopyFrom(ManagedMaterial source, MaterialHandle newHandle)
         {
-            ParamEntry[]? srcCopy = null;
-            int srcCount;
-            lock (source._paramLock)
+            if (ReferenceEquals(source, this))
             {
-                srcCount = source._paramCount;
-                if (srcCount > 0)
-                {
-                    srcCopy = new ParamEntry[srcCount];
-                    Array.Copy(source._params, srcCopy, srcCount);
-                }
+                Handle = newHandle;
+                return;
+            }
 
+            // 按单调实例序号固定加锁顺序，实现零堆分配直拷且彻底杜绝双锁死锁
+            object firstLock = source._lockOrder < _lockOrder ? source._paramLock : _paramLock;
+            object secondLock = source._lockOrder < _lockOrder ? _paramLock : source._paramLock;
+
+            lock (firstLock)
+            lock (secondLock)
+            {
                 Handle = newHandle;
                 Shader = source.Shader;
                 TechniqueIndex = source.TechniqueIndex;
@@ -117,22 +139,8 @@ namespace Apotheosis.Runtime.Rendering.Materials
                 Sampler3 = source.Sampler3;
                 FallbackToMagicPixel = source.FallbackToMagicPixel;
                 PrimaryTextureSlot = source.PrimaryTextureSlot;
-            }
 
-            lock (_paramLock)
-            {
-                if (srcCount > 0 && srcCopy is not null)
-                {
-                    if (_params.Length < srcCount)
-                        _params = new ParamEntry[srcCount];
-
-                    Array.Copy(srcCopy, _params, srcCount);
-                }
-
-                if (_paramCount > srcCount)
-                    Array.Clear(_params, srcCount, _paramCount - srcCount);
-
-                _paramCount = srcCount;
+                _params.CopyFrom(source._params.AsReadOnlySpan());
             }
         }
 
@@ -314,10 +322,9 @@ namespace Apotheosis.Runtime.Rendering.Materials
                 bool primaryTextureBound = false;
                 lock (_paramLock)
                 {
-                    int count = _paramCount;
-                    ParamEntry[] entries = _params;
+                    ReadOnlySpan<ParamEntry> entries = _params.AsReadOnlySpan();
 
-                    for (int i = 0; i < count; i++)
+                    for (int i = 0; i < entries.Length; i++)
                     {
                         ref readonly ParamEntry e = ref entries[i];
                         switch (e.Kind)
@@ -387,21 +394,16 @@ namespace Apotheosis.Runtime.Rendering.Materials
 
         private ref ParamEntry GetOrAddSlotLocked(int slot)
         {
-            for (int i = 0; i < _paramCount; i++)
+            int count = _params.Count;
+            for (int i = 0; i < count; i++)
             {
                 if (_params[i].Slot == slot)
                     return ref _params[i];
             }
 
-            if (_paramCount >= _params.Length)
-            {
-                int newCap = _params.Length == 0 ? 4 : _params.Length * 2;
-                Array.Resize(ref _params, newCap);
-            }
-
-            int idx = _paramCount++;
-            _params[idx] = new ParamEntry { Slot = slot };
-            return ref _params[idx];
+            ref ParamEntry added = ref _params.AddRef();
+            added.Slot = slot;
+            return ref added;
         }
     }
 }

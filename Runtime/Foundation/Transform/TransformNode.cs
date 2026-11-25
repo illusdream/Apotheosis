@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using Apotheosis.Runtime.Foundation.Collections;
 using Apotheosis.Runtime.Foundation.Transform.Bindings;
 using Apotheosis.Runtime.Foundation.Transform.Resolvers;
 using Microsoft.Xna.Framework;
@@ -12,7 +13,7 @@ namespace Apotheosis.Runtime.Foundation.Transform
     /// 3D 场景图变换节点：维护局部 <see cref="Transform3D"/>、父子层级关系、惰性世界矩阵缓存、
     /// 显式实体绑定、级联清理虚函数以及代际安全对象池复用能力。
     /// </summary>
-    public class TransformNode
+    public class TransformNode : IIndexedSwapItem
     {
         private const float SingularMatrixEpsilon = 1e-12f;
         private const int MaxRetainedChildrenCapacity = 64;
@@ -21,6 +22,8 @@ namespace Apotheosis.Runtime.Foundation.Transform
 
         private TransformNode? _parent;
         private Transform3D _local;
+        private int _depth;
+        private int _worldListIndex = RuntimeConstants.InvalidIndex;
 
         private Matrix _localMatrix = Matrix.Identity;
         private Matrix _worldMatrix = Matrix.Identity;
@@ -37,7 +40,9 @@ namespace Apotheosis.Runtime.Foundation.Transform
         private bool _isCleaningUp;
         private Action<TransformNode>? _poolReturnAction;
 
-        internal bool IsRegisteredInWorld { get; set; }
+        int IIndexedSwapItem.SwapListIndex { get => _worldListIndex; set => _worldListIndex = value; }
+
+        internal bool IsRegisteredInWorld => _worldListIndex >= 0;
         internal bool InPool { get; set; }
 
         /// <summary>可选调试名称（便于日志与 DebugTool 检视）。</summary>
@@ -127,22 +132,8 @@ namespace Apotheosis.Runtime.Foundation.Transform
             }
         }
 
-        /// <summary>在层级树中的深度（根节点为 0）。</summary>
-        public int Depth
-        {
-            get
-            {
-                int depth = 0;
-                TransformNode? current = _parent;
-                while (current is not null)
-                {
-                    depth++;
-                    current = current._parent;
-                }
-
-                return depth;
-            }
-        }
+        /// <summary>在层级树中的深度（根节点为 0，O(1) 缓存读取）。</summary>
+        public int Depth => _depth;
 
         /// <summary>判断当前节点是否为 <paramref name="ancestor"/> 的后代节点。</summary>
         public bool IsDescendantOf(TransformNode ancestor)
@@ -207,6 +198,7 @@ namespace Apotheosis.Runtime.Foundation.Transform
             _parent?._children.Remove(this);
             _parent = newParent;
             newParent?._children.Add(this);
+            UpdateDepthRecursive(newParent is null ? 0 : newParent._depth + 1);
 
             if (worldPositionStays)
             {
@@ -671,6 +663,7 @@ namespace Apotheosis.Runtime.Foundation.Transform
                 {
                     _parent._children.Remove(this);
                     _parent = null;
+                    _depth = 0;
                 }
 
                 IsDisposed = true;
@@ -716,6 +709,8 @@ namespace Apotheosis.Runtime.Foundation.Transform
         {
             Name = null;
             ShouldCleanupTargetPredicate = null;
+            _depth = 0;
+            _worldListIndex = RuntimeConstants.InvalidIndex;
             _local = Transform3D.Identity;
             _localMatrix = Matrix.Identity;
             _worldMatrix = Matrix.Identity;
@@ -736,7 +731,71 @@ namespace Apotheosis.Runtime.Foundation.Transform
             OnResetForPool();
         }
 
-        // ==================== 内部脏标记与缓存维护 ====================
+        // ==================== 批量同步与内部脏标记维护 ====================
+
+        /// <summary>批量写入 2D 世界空间同步结果，整棵子树仅触发一次脏传播。</summary>
+        internal void ApplyWorld2DSync(bool setPosition, Vector2 worldCenter, bool setRotation, float worldRotationZ,
+            bool setUniformScale, float uniformScale, bool setFlip, bool flipX, bool flipY)
+        {
+            ThrowIfDisposed();
+
+            Transform3D next = _local;
+            TransformNode? parent = _parent;
+
+            if (setPosition)
+            {
+                float worldZ = parent is null ? _local.Position.Z : WorldPosition.Z;
+                Vector3 targetWorldPos = new(worldCenter, worldZ);
+                next.Position = parent is null ? targetWorldPos : Vector3.Transform(targetWorldPos, parent.WorldInverseMatrix);
+            }
+
+            if (setRotation)
+            {
+                Quaternion targetWorldRot = Transform3D.NormalizeOrIdentity(Quaternion.CreateFromAxisAngle(Vector3.UnitZ, worldRotationZ));
+                if (parent is null)
+                {
+                    next.Rotation = targetWorldRot;
+                }
+                else
+                {
+                    Quaternion invParent = Quaternion.Inverse(Transform3D.NormalizeOrIdentity(parent.WorldRotation));
+                    next.Rotation = Transform3D.NormalizeOrIdentity(Transform3D.ConjugateBySign(invParent * targetWorldRot, parent.WorldScaleSign));
+                }
+            }
+
+            if (setUniformScale)
+            {
+                float mag = MathF.Abs(uniformScale);
+                Vector3 parentScale = parent?.WorldScale ?? Vector3.One;
+                float localMagX = MathF.Abs(parentScale.X) > 1e-6f ? mag / MathF.Abs(parentScale.X) : mag;
+                float localMagY = MathF.Abs(parentScale.Y) > 1e-6f ? mag / MathF.Abs(parentScale.Y) : mag;
+                next.Scale = new Vector3(next.Scale.X < 0f ? -localMagX : localMagX, next.Scale.Y < 0f ? -localMagY : localMagY, next.Scale.Z);
+            }
+
+            if (setFlip)
+            {
+                Vector3 parentSign = parent?.WorldScaleSign ?? Vector3.One;
+                bool localFlipX = flipX ^ (parentSign.X < 0f);
+                bool localFlipY = flipY ^ (parentSign.Y < 0f);
+                float absX = MathF.Abs(next.Scale.X);
+                float absY = MathF.Abs(next.Scale.Y);
+                next.Scale.X = localFlipX ? -absX : absX;
+                next.Scale.Y = localFlipY ? -absY : absY;
+            }
+
+            if (_local.Equals(next))
+                return;
+
+            _local = next;
+            MarkLocalDirty();
+        }
+
+        private void UpdateDepthRecursive(int newDepth)
+        {
+            _depth = newDepth;
+            for (int i = 0; i < _children.Count; i++)
+                _children[i].UpdateDepthRecursive(newDepth + 1);
+        }
 
         private void MarkLocalDirty()
         {

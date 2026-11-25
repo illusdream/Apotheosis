@@ -3,7 +3,6 @@
 using System;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
-using Terraria;
 
 namespace Apotheosis.Runtime.Rendering.PostProcess
 {
@@ -70,16 +69,11 @@ namespace Apotheosis.Runtime.Rendering.PostProcess
             if (vb is null && ib is null)
                 return;
 
-            void DisposeBuffers()
+            GpuResourceHelper.RunOnMainThread(() =>
             {
-                try { if (vb is { IsDisposed: false }) vb.Dispose(); } catch { /* 卸载期忽略 */ }
-                try { if (ib is { IsDisposed: false }) ib.Dispose(); } catch { /* 卸载期忽略 */ }
-            }
-
-            if (RenderManager.Shaders.IsOnMainThread)
-                DisposeBuffers();
-            else
-                Main.QueueMainThreadAction(DisposeBuffers);
+                GpuResourceHelper.DisposeSafe(vb);
+                GpuResourceHelper.DisposeSafe(ib);
+            });
         }
 
         internal void ResetForLoad()
@@ -94,7 +88,8 @@ namespace Apotheosis.Runtime.Rendering.PostProcess
         {
             lock (_sync)
             {
-                if (_disposed || (_vertexBuffer is { IsDisposed: false } && _indexBuffer is { IsDisposed: false }))
+                if (_disposed || (_vertexBuffer is { IsDisposed: false } vb && ReferenceEquals(vb.GraphicsDevice, gd)
+                    && _indexBuffer is { IsDisposed: false } ib && ReferenceEquals(ib.GraphicsDevice, gd)))
                     return;
             }
 
@@ -108,11 +103,22 @@ namespace Apotheosis.Runtime.Rendering.PostProcess
             };
             short[] indices = { 0, 1, 2, 0, 2, 3 };
 
-            var newVb = new VertexBuffer(gd, VertexPositionTexture.VertexDeclaration, 4, BufferUsage.WriteOnly);
-            newVb.SetData(vertices);
+            VertexBuffer? newVb = null;
+            IndexBuffer? newIb = null;
+            try
+            {
+                newVb = new VertexBuffer(gd, VertexPositionTexture.VertexDeclaration, 4, BufferUsage.WriteOnly);
+                newVb.SetData(vertices);
 
-            var newIb = new IndexBuffer(gd, IndexElementSize.SixteenBits, 6, BufferUsage.WriteOnly);
-            newIb.SetData(indices);
+                newIb = new IndexBuffer(gd, IndexElementSize.SixteenBits, 6, BufferUsage.WriteOnly);
+                newIb.SetData(indices);
+            }
+            catch
+            {
+                GpuResourceHelper.DisposeSafe(newVb);
+                GpuResourceHelper.DisposeSafe(newIb);
+                throw;
+            }
 
             VertexBuffer? oldVb = null;
             IndexBuffer? oldIb = null;
@@ -120,8 +126,8 @@ namespace Apotheosis.Runtime.Rendering.PostProcess
             {
                 if (_disposed || RenderManager.IsUnloading)
                 {
-                    newVb.Dispose();
-                    newIb.Dispose();
+                    GpuResourceHelper.DisposeSafe(newVb);
+                    GpuResourceHelper.DisposeSafe(newIb);
                     return;
                 }
 
@@ -131,8 +137,8 @@ namespace Apotheosis.Runtime.Rendering.PostProcess
                 _indexBuffer = newIb;
             }
 
-            if (oldVb is { IsDisposed: false }) oldVb.Dispose();
-            if (oldIb is { IsDisposed: false }) oldIb.Dispose();
+            GpuResourceHelper.DisposeSafe(oldVb);
+            GpuResourceHelper.DisposeSafe(oldIb);
         }
     }
 }

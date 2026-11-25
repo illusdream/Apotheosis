@@ -39,6 +39,8 @@ namespace Apotheosis.DebugTool.Gizmos
             public nint DrawListHandle;
             public WorldScreenTransform Transform;
             public GizmoSettings Settings;
+            public ulong[] EnabledChannelBits;
+            public int EnabledChannelWordCount;
             public List<NumVec2> ScreenScratch;
             public List<NumVec2> SectorScratch;
             public IReadOnlyList<Vector2>? ActivePolyVertices;
@@ -53,6 +55,7 @@ namespace Apotheosis.DebugTool.Gizmos
 
         private readonly List<NumVec2> _screenScratch = new(128);
         private readonly List<NumVec2> _sectorScratch = new(128);
+        private ulong[] _enabledChannelBits = new ulong[2];
 
         private static readonly Action EmitSelfTestDemoAction = EmitSelfTestDemo;
         private static readonly DrawPayloadDelegate<MarkerPayload> DrawMarkerHandler = DrawMarker;
@@ -87,6 +90,11 @@ namespace Apotheosis.DebugTool.Gizmos
             lock (buffer.SyncRoot)
             {
                 buffer.CollectOverlayProvidersLocked(settings.ShowSelfTestDemo ? EmitSelfTestDemoAction : null);
+
+                // 在采集完 Provider 之后单次加锁快照全部频道位图，后续逐图元无锁 O(1) 判定
+                settings.CopyEnabledBitsSnapshot(ref _enabledChannelBits, out int enabledWordCount);
+                ctx.EnabledChannelBits = _enabledChannelBits;
+                ctx.EnabledChannelWordCount = enabledWordCount;
 
                 RenderTrack(ref ctx, buffer.Markers, DrawMarkerHandler);
                 RenderTrack(ref ctx, buffer.Segments, DrawSegmentHandler);
@@ -147,7 +155,7 @@ namespace Apotheosis.DebugTool.Gizmos
                 GizmoEntry<TPayload> entry = entries[i];
                 ctx.Submitted++;
 
-                if (!ctx.Settings.IsChannelEnabled(entry.Meta.Channel))
+                if (!GizmoSettings.IsEnabledInSnapshot(ctx.EnabledChannelBits, ctx.EnabledChannelWordCount, entry.Meta.ChannelId))
                 {
                     ctx.Culled++;
                     continue;

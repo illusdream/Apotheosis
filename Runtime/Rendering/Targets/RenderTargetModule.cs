@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Threading;
+using Apotheosis.Runtime.Foundation.Collections;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Terraria;
@@ -33,15 +34,13 @@ namespace Apotheosis.Runtime.Rendering.Targets
         private readonly Dictionary<string, PooledFrameRenderTarget> _channelsByName = new(StringComparer.Ordinal);
         private readonly Dictionary<string, PersistentRenderTarget> _persistentByKey = new(StringComparer.Ordinal);
         private readonly Dictionary<RenderTargetPoolKey, List<PooledEntry>> _idleBuckets = new();
-        private readonly List<PooledEntry> _activeEntries = new(16);
+        private readonly IndexedSwapList<PooledEntry> _activeEntries = new(16);
         private readonly List<PooledFrameRenderTarget> _activeChannelsThisFrame = new(8);
         private readonly List<PooledFrameRenderTarget> _endFrameChannelScratch = new(8);
-        private readonly List<RenderTargetPoolKey> _emptyBucketKeys = new(8);
         private readonly object _lock = new();
 
         // 渲染目标压栈与预分配 2~4 路 MRT 缓冲（仅主线程访问，Unload 时派发到主线程重置）
-        private ScopeFrame[] _scopeStack;
-        private int _scopeDepth;
+        private ValueBuffer<ScopeFrame> _scopeStack = new(InitialScopeStackCapacity, InitialScopeStackCapacity);
         private int _nextScopeToken;
         private readonly RenderTargetBinding[] _mrt2 = new RenderTargetBinding[2];
         private readonly RenderTargetBinding[] _mrt3 = new RenderTargetBinding[3];
@@ -68,7 +67,6 @@ namespace Apotheosis.Runtime.Rendering.Targets
 
         public RenderTargetModule()
         {
-            _scopeStack = new ScopeFrame[InitialScopeStackCapacity];
             RegisterBuiltInsLocked();
         }
 
@@ -442,7 +440,7 @@ namespace Apotheosis.Runtime.Rendering.Targets
 
                 entry.InUse = false;
                 entry.LeaseToken++;
-                RemoveActiveEntryLocked(entry);
+                _activeEntries.Remove(entry);
 
                 if (entry.IsDisposed || entry.Target.IsDisposed)
                 {
@@ -482,20 +480,15 @@ namespace Apotheosis.Runtime.Rendering.Targets
             }
 
             // 兼容后台 ModSystem.Unload() 触发的归还：真正需要释放 GPU 资源时派发到主线程
-            if (toDispose is not null && !toDispose.IsDisposed)
-            {
-                if (RenderManager.Shaders.IsOnMainThread)
-                    toDispose.Dispose();
-                else
-                    Main.QueueMainThreadAction(() => { if (!toDispose.IsDisposed) toDispose.Dispose(); });
-            }
+            GpuResourceHelper.DisposeOnMainThread(toDispose);
         }
 
         internal void PopScope(GraphicsDevice gd, int expectedDepth, int expectedToken)
         {
             RenderManager.Shaders.AssertMainThread("RenderTargetModule.PopScope");
 
-            if (expectedToken == 0 || expectedDepth < 0 || expectedDepth >= _scopeDepth)
+            int depth = _scopeStack.Count;
+            if (expectedToken == 0 || expectedDepth < 0 || expectedDepth >= depth)
                 return;
 
             ref ScopeFrame targetFrame = ref _scopeStack[expectedDepth];
@@ -503,23 +496,21 @@ namespace Apotheosis.Runtime.Rendering.Targets
                 return;
 
             // 若内层作用域遗漏释放，自动回卷清理内层栈帧并恢复当前外层保存的绑定，避免整帧卡死
-            if (expectedDepth < _scopeDepth - 1)
+            if (expectedDepth < depth - 1)
             {
 #if DEBUG
-                int leakedCount = (_scopeDepth - 1) - expectedDepth;
+                int leakedCount = (depth - 1) - expectedDepth;
                 _logger?.Warn($"[RenderTargetModule] 检测到 {leakedCount} 层嵌套 RenderTargetScope 未按序释放，已自动回卷恢复外层绑定。");
 #endif
-                for (int i = _scopeDepth - 1; i > expectedDepth; i--)
+                for (int i = depth - 1; i > expectedDepth; i--)
                 {
-                    _scopeStack[i].SavedBindings = null;
-                    _scopeStack[i].Token = 0;
+                    _scopeStack[i] = default;
                 }
             }
 
             RenderTargetBinding[]? saved = targetFrame.SavedBindings;
-            targetFrame.SavedBindings = null;
-            targetFrame.Token = 0;
-            _scopeDepth = expectedDepth;
+            targetFrame = default;
+            _scopeStack.SetCount(expectedDepth);
 
             if (!gd.IsDisposed)
             {
@@ -656,7 +647,6 @@ namespace Apotheosis.Runtime.Rendering.Targets
                 {
                     PooledEntry entry = _activeEntries[i];
                     entry.InUse = false;
-                    entry.ActiveIndex = -1;
                     entry.IsDisposed = true;
                     poolRtsToDispose ??= new List<RenderTarget2D>();
                     poolRtsToDispose.Add(entry.Target);
@@ -679,7 +669,6 @@ namespace Apotheosis.Runtime.Rendering.Targets
                 _activeEntries.Clear();
                 _idleBuckets.Clear();
                 _activeChannelsThisFrame.Clear();
-                _emptyBucketKeys.Clear();
                 Volatile.Write(ref _count, 0);
 
                 _refWidth = 0;
@@ -696,10 +685,9 @@ namespace Apotheosis.Runtime.Rendering.Targets
             }
 
             // 仅主线程访问的 _scopeStack / _mrt2..4 以及 GPU 释放全部派发至主线程执行，杜绝后台线程竞态
-            void DisposeAndResetOnMainThread()
+            GpuResourceHelper.RunOnMainThread(() =>
             {
-                Array.Clear(_scopeStack);
-                _scopeDepth = 0;
+                _scopeStack.Clear(clearReferences: true);
                 Array.Clear(_mrt2);
                 Array.Clear(_mrt3);
                 Array.Clear(_mrt4);
@@ -708,31 +696,15 @@ namespace Apotheosis.Runtime.Rendering.Targets
                 if (targetsToDispose is not null)
                 {
                     for (int i = 0; i < targetsToDispose.Count; i++)
-                    {
-                        try { targetsToDispose[i].Dispose(); }
-                        catch { /* 卸载期忽略清理异常 */ }
-                    }
+                        GpuResourceHelper.DisposeSafe(targetsToDispose[i]);
                 }
 
                 if (poolRtsToDispose is not null)
                 {
                     for (int i = 0; i < poolRtsToDispose.Count; i++)
-                    {
-                        try
-                        {
-                            RenderTarget2D rt = poolRtsToDispose[i];
-                            if (!rt.IsDisposed)
-                                rt.Dispose();
-                        }
-                        catch { /* 卸载期忽略清理异常 */ }
-                    }
+                        GpuResourceHelper.DisposeSafe(poolRtsToDispose[i]);
                 }
-            }
-
-            if (RenderManager.Shaders.IsOnMainThread)
-                DisposeAndResetOnMainThread();
-            else
-                Main.QueueMainThreadAction(DisposeAndResetOnMainThread);
+            });
         }
 
         // ==================== 内部实现 ====================
@@ -797,7 +769,7 @@ namespace Apotheosis.Runtime.Rendering.Targets
                         candidate.IsTransientLease = isTransientLease;
                         candidate.LeasedFrame = RenderManager.FrameId;
                         candidate.LeaseToken++;
-                        AddActiveEntryLocked(candidate);
+                        _activeEntries.Add(candidate);
 
                         _totalReused++;
                         entry = candidate;
@@ -816,7 +788,7 @@ namespace Apotheosis.Runtime.Rendering.Targets
                     LeaseToken = 1,
                 };
 
-                AddActiveEntryLocked(created);
+                _activeEntries.Add(created);
                 _totalCreated++;
                 _estimatedPoolVramBytes += created.EstimatedBytes;
 
@@ -939,16 +911,14 @@ namespace Apotheosis.Runtime.Rendering.Targets
                     break;
             }
 
-            if (_scopeDepth >= _scopeStack.Length)
-                Array.Resize(ref _scopeStack, _scopeStack.Length * 2);
-
-            int depth = _scopeDepth++;
+            int depth = _scopeStack.Count;
             int token = ++_nextScopeToken;
             if (token == 0)
                 token = ++_nextScopeToken;
 
-            _scopeStack[depth].SavedBindings = prevBindings;
-            _scopeStack[depth].Token = token;
+            ref ScopeFrame frame = ref _scopeStack.AddRef();
+            frame.SavedBindings = prevBindings;
+            frame.Token = token;
 
             RenderManager.InvalidateViewContext();
             return new RenderTargetScope(this, gd, depth, token);
@@ -959,30 +929,6 @@ namespace Apotheosis.Runtime.Rendering.Targets
             ArgumentNullException.ThrowIfNull(rt, paramName);
             if (rt.IsDisposed)
                 throw new ObjectDisposedException(paramName, "无法将已释放的 RenderTarget2D 绑定至 MRT。");
-        }
-
-        private void AddActiveEntryLocked(PooledEntry entry)
-        {
-            entry.ActiveIndex = _activeEntries.Count;
-            _activeEntries.Add(entry);
-        }
-
-        private void RemoveActiveEntryLocked(PooledEntry entry)
-        {
-            int idx = entry.ActiveIndex;
-            if (idx < 0 || idx >= _activeEntries.Count)
-                return;
-
-            int lastIdx = _activeEntries.Count - 1;
-            if (idx != lastIdx)
-            {
-                PooledEntry last = _activeEntries[lastIdx];
-                _activeEntries[idx] = last;
-                last.ActiveIndex = idx;
-            }
-
-            _activeEntries.RemoveAt(lastIdx);
-            entry.ActiveIndex = -1;
         }
 
         private RenderTarget2D? MarkEntryForDisposalLocked(PooledEntry entry)
@@ -998,23 +944,17 @@ namespace Apotheosis.Runtime.Rendering.Targets
         private void DisposePooledEntryOnMainThreadLocked(PooledEntry entry)
         {
             RenderTarget2D? rt = MarkEntryForDisposalLocked(entry);
-            if (rt is not null && !rt.IsDisposed)
-                rt.Dispose();
+            GpuResourceHelper.DisposeSafe(rt);
         }
 
         private void PruneEmptyBucketsLocked()
         {
-            _emptyBucketKeys.Clear();
+            // .NET Core 3.0+ 保证遍历 Dictionary 期间直接 Remove 不使枚举器失效
             foreach (KeyValuePair<RenderTargetPoolKey, List<PooledEntry>> kv in _idleBuckets)
             {
                 if (kv.Value.Count == 0)
-                    _emptyBucketKeys.Add(kv.Key);
+                    _idleBuckets.Remove(kv.Key);
             }
-
-            for (int i = 0; i < _emptyBucketKeys.Count; i++)
-                _idleBuckets.Remove(_emptyBucketKeys[i]);
-
-            _emptyBucketKeys.Clear();
         }
 
         private static GraphicsDevice GetRequiredGraphicsDevice(string caller)

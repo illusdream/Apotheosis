@@ -2,6 +2,7 @@
 
 using System;
 using System.Runtime.CompilerServices;
+using Apotheosis.Runtime.Foundation.Collections;
 using Microsoft.Xna.Framework.Graphics;
 
 namespace Apotheosis.Runtime.Rendering.Geometry
@@ -9,62 +10,38 @@ namespace Apotheosis.Runtime.Rendering.Geometry
     /// <summary>单基础网格的硬件实例化容器。</summary>
     public sealed class InstancedMesh : IInstancedMesh
     {
-        private InstanceData[] _instances;
-        private int _count;
+        private ValueBuffer<InstanceData> _instances;
 
         public MeshHandle BaseMesh { get; set; }
-        public int Count => _count;
+        public int Count => _instances.Count;
 
         public PrimitiveType PrimitiveType => PrimitiveType.TriangleList;
-        public bool IsEmpty => _count == 0 || !BaseMesh.IsValid;
+        public bool IsEmpty => _instances.Count == 0 || !BaseMesh.IsValid;
         public bool IsStatic => false;
         public int GroupCount => 1;
 
         public InstancedMesh(MeshHandle baseMesh, int initialCapacity = 128)
         {
             BaseMesh = baseMesh;
-            _instances = initialCapacity > 0 ? new InstanceData[initialCapacity] : Array.Empty<InstanceData>();
+            _instances = new ValueBuffer<InstanceData>(initialCapacity, defaultGrowCapacity: 128);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void Clear() => _count = 0;
+        public void Clear() => _instances.Clear(clearReferences: false);
 
         internal void ResetForPool(MeshHandle baseMesh)
         {
             BaseMesh = baseMesh;
-            _count = 0;
+            Clear();
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void Add(in InstanceData instance)
-        {
-            if (_count >= _instances.Length)
-            {
-                int newCap = _instances.Length == 0 ? 128 : _instances.Length * 2;
-                Array.Resize(ref _instances, newCap);
-            }
+        public void Add(in InstanceData instance) => _instances.Add(in instance);
 
-            _instances[_count++] = instance;
-        }
-
-        public void AddRange(ReadOnlySpan<InstanceData> items)
-        {
-            if (items.IsEmpty)
-                return;
-
-            int required = _count + items.Length;
-            if (required > _instances.Length)
-            {
-                int newCap = Math.Max(required, _instances.Length == 0 ? 128 : _instances.Length * 2);
-                Array.Resize(ref _instances, newCap);
-            }
-
-            items.CopyTo(_instances.AsSpan(_count));
-            _count = required;
-        }
+        public void AddRange(ReadOnlySpan<InstanceData> items) => _instances.AddRange(items);
 
         public MeshHandle GetGroupBaseMesh(int groupIndex) => BaseMesh;
-        public ReadOnlySpan<InstanceData> GetGroupInstances(int groupIndex) => _instances.AsSpan(0, _count);
+        public ReadOnlySpan<InstanceData> GetGroupInstances(int groupIndex) => _instances.AsReadOnlySpan();
 
         public ReadOnlySpan<UnifiedVertex> GetVertices() => ReadOnlySpan<UnifiedVertex>.Empty;
         public ReadOnlySpan<int> GetIndices() => ReadOnlySpan<int>.Empty;
@@ -77,8 +54,7 @@ namespace Apotheosis.Runtime.Rendering.Geometry
         private struct GroupBucket
         {
             public MeshHandle BaseMesh;
-            public InstanceData[] Items;
-            public int Count;
+            public ValueBuffer<InstanceData> Items;
         }
 
         private readonly GroupBucket[] _groups;
@@ -93,7 +69,7 @@ namespace Apotheosis.Runtime.Rendering.Geometry
             {
                 for (int i = 0; i < _groups.Length; i++)
                 {
-                    if (_groups[i].Count > 0 && _groups[i].BaseMesh.IsValid)
+                    if (_groups[i].Items.Count > 0 && _groups[i].BaseMesh.IsValid)
                         return false;
                 }
 
@@ -101,10 +77,7 @@ namespace Apotheosis.Runtime.Rendering.Geometry
             }
         }
 
-        public MultiGroupInstancedMesh(params MeshHandle[] baseMeshes)
-            : this(64, baseMeshes)
-        {
-        }
+        public MultiGroupInstancedMesh(params MeshHandle[] baseMeshes) : this(64, baseMeshes) { }
 
         public MultiGroupInstancedMesh(int initialCapacityPerGroup, params MeshHandle[] baseMeshes)
         {
@@ -117,45 +90,29 @@ namespace Apotheosis.Runtime.Rendering.Geometry
                 _groups[i] = new GroupBucket
                 {
                     BaseMesh = baseMeshes[i],
-                    Items = initialCapacityPerGroup > 0 ? new InstanceData[initialCapacityPerGroup] : Array.Empty<InstanceData>(),
-                    Count = 0,
+                    Items = new ValueBuffer<InstanceData>(initialCapacityPerGroup, defaultGrowCapacity: 64),
                 };
             }
         }
 
-        public void SetGroupBaseMesh(int groupIndex, MeshHandle baseMesh)
-            => _groups[groupIndex].BaseMesh = baseMesh;
+        public void SetGroupBaseMesh(int groupIndex, MeshHandle baseMesh) => _groups[groupIndex].BaseMesh = baseMesh;
 
-        public int GetGroupCount(int groupIndex) => _groups[groupIndex].Count;
+        public int GetGroupCount(int groupIndex) => _groups[groupIndex].Items.Count;
 
         public void ClearAll()
         {
             for (int i = 0; i < _groups.Length; i++)
-                _groups[i].Count = 0;
+                _groups[i].Items.Clear(clearReferences: false);
         }
 
-        public void ClearGroup(int groupIndex) => _groups[groupIndex].Count = 0;
+        public void ClearGroup(int groupIndex) => _groups[groupIndex].Items.Clear(clearReferences: false);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void Add(int groupIndex, in InstanceData instance)
-        {
-            ref GroupBucket group = ref _groups[groupIndex];
-            if (group.Count >= group.Items.Length)
-            {
-                int newCap = group.Items.Length == 0 ? 64 : group.Items.Length * 2;
-                Array.Resize(ref group.Items, newCap);
-            }
-
-            group.Items[group.Count++] = instance;
-        }
+        public void Add(int groupIndex, in InstanceData instance) => _groups[groupIndex].Items.Add(in instance);
 
         public MeshHandle GetGroupBaseMesh(int groupIndex) => _groups[groupIndex].BaseMesh;
 
-        public ReadOnlySpan<InstanceData> GetGroupInstances(int groupIndex)
-        {
-            ref GroupBucket group = ref _groups[groupIndex];
-            return group.Items.AsSpan(0, group.Count);
-        }
+        public ReadOnlySpan<InstanceData> GetGroupInstances(int groupIndex) => _groups[groupIndex].Items.AsReadOnlySpan();
 
         public ReadOnlySpan<UnifiedVertex> GetVertices() => ReadOnlySpan<UnifiedVertex>.Empty;
         public ReadOnlySpan<int> GetIndices() => ReadOnlySpan<int>.Empty;

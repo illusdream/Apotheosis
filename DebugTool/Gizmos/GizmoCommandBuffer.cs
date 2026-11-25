@@ -59,7 +59,7 @@ namespace Apotheosis.DebugTool.Gizmos
             _timed.Clear();
         }
 
-        public void DecayTimed(float deltaSeconds, Action<string> onExpired)
+        public void DecayTimed(float deltaSeconds, Action<ushort> onExpired)
         {
             for (int i = _timed.Count - 1; i >= 0; i--)
             {
@@ -67,7 +67,7 @@ namespace Apotheosis.DebugTool.Gizmos
                 entry.Meta.RemainingDuration -= deltaSeconds;
                 if (entry.Meta.RemainingDuration <= 0f)
                 {
-                    onExpired(entry.Meta.Channel);
+                    onExpired(entry.Meta.ChannelId);
 
                     int last = _timed.Count - 1;
                     if (i != last)
@@ -91,16 +91,24 @@ namespace Apotheosis.DebugTool.Gizmos
     {
         private sealed class ChannelCounter
         {
+            public readonly ushort ChannelId;
+            public readonly string Name;
             public int WritingFrameCount;
             public int ActiveFrameCount;
             public int PendingOverlayCount;
             public int LastFrameCount;
             public int TimedCount;
+
+            public ChannelCounter(ushort channelId, string name)
+            {
+                ChannelId = channelId;
+                Name = name;
+            }
         }
 
         private readonly object _sync = new();
         private readonly GizmoSettings _settings;
-        private readonly Action<string> _onTimedExpired;
+        private readonly Action<ushort> _onTimedExpired;
 
         private readonly GizmoTrack<MarkerPayload> _markers = new();
         private readonly GizmoTrack<SegmentPayload> _segments = new();
@@ -113,8 +121,8 @@ namespace Apotheosis.DebugTool.Gizmos
         private readonly List<Vector2> _overlayPolyVertices = new(128);
 
         private readonly List<IGizmoProvider> _providers = new();
-        private readonly Dictionary<string, ChannelCounter> _channels = new(StringComparer.OrdinalIgnoreCase);
-        private readonly List<string> _sortedChannelNames = new();
+        private readonly List<ChannelCounter?> _countersById = new(16);
+        private readonly List<ChannelCounter> _activeCounters = new(16);
 
         private bool _inDrawPhase;
         private bool _collectingOverlay;
@@ -237,10 +245,8 @@ namespace Apotheosis.DebugTool.Gizmos
                 if (!IsEnabled)
                     return;
 
-                string ch = NormalizeChannel(channel);
                 int limit = GetCommandLimit();
                 float safeDuration = SanitizeDuration(duration);
-                GizmoMeta meta = CreateMeta(ch, color, thickness, safeDuration);
                 float alpha = float.IsFinite(fillAlpha) ? Math.Clamp(fillAlpha, 0f, 1f) : 0f;
 
                 if (safeDuration > 0f)
@@ -251,11 +257,14 @@ namespace Apotheosis.DebugTool.Gizmos
                         return;
                     }
 
+                    ChannelCounter timedCounter = EnsureChannelLocked(NormalizeChannel(channel));
+                    GizmoMeta timedMeta = CreateMeta(timedCounter.ChannelId, color, thickness, safeDuration);
+
                     Vector2[] copy = new Vector2[points.Length];
                     points.CopyTo(copy);
 
-                    _polys.AddTimed(in meta, new PolyPayload(0, copy.Length, copy, closed, filled, alpha));
-                    EnsureChannelLocked(ch).TimedCount++;
+                    _polys.AddTimed(in timedMeta, new PolyPayload(0, copy.Length, copy, closed, filled, alpha));
+                    timedCounter.TimedCount++;
                     TimedCount = TotalTimedCountLocked();
                     return;
                 }
@@ -275,13 +284,15 @@ namespace Apotheosis.DebugTool.Gizmos
                     return;
                 }
 
+                ChannelCounter counter = EnsureChannelLocked(NormalizeChannel(channel));
+                GizmoMeta meta = CreateMeta(counter.ChannelId, color, thickness, safeDuration);
+
                 List<Vector2> vertPool = routeToOverlay ? _overlayPolyVertices : _writingPolyVertices;
                 int offset = vertPool.Count;
                 for (int i = 0; i < points.Length; i++)
                     vertPool.Add(points[i]);
 
                 var payload = new PolyPayload(offset, points.Length, ownedVertices: null, closed, filled, alpha);
-                ChannelCounter counter = EnsureChannelLocked(ch);
 
                 if (routeToOverlay)
                 {
@@ -497,9 +508,9 @@ namespace Apotheosis.DebugTool.Gizmos
                 {
                     IGizmoProvider provider = _providers[i];
                     string ch = NormalizeChannel(provider.Channel);
-                    EnsureChannelLocked(ch);
+                    ChannelCounter counter = EnsureChannelLocked(ch);
 
-                    if (!_settings.IsChannelEnabled(ch))
+                    if (!_settings.IsChannelEnabled(counter.ChannelId))
                         continue;
 
                     try
@@ -530,8 +541,9 @@ namespace Apotheosis.DebugTool.Gizmos
             LastCulledCount = culledCount;
             LastFrameOverflowed = _activeFrameOverflowed || _pendingOverlayOverflowed;
 
-            foreach (ChannelCounter counter in _channels.Values)
+            for (int i = 0; i < _activeCounters.Count; i++)
             {
+                ChannelCounter counter = _activeCounters[i];
                 counter.LastFrameCount = counter.ActiveFrameCount + counter.PendingOverlayCount;
                 counter.PendingOverlayCount = 0;
             }
@@ -550,15 +562,14 @@ namespace Apotheosis.DebugTool.Gizmos
             {
                 if (_channelListDirty)
                 {
-                    _sortedChannelNames.Sort(StringComparer.OrdinalIgnoreCase);
+                    _activeCounters.Sort(static (a, b) => StringComparer.OrdinalIgnoreCase.Compare(a.Name, b.Name));
                     _channelListDirty = false;
                 }
 
-                for (int i = 0; i < _sortedChannelNames.Count; i++)
+                for (int i = 0; i < _activeCounters.Count; i++)
                 {
-                    string name = _sortedChannelNames[i];
-                    if (_channels.TryGetValue(name, out ChannelCounter? counter))
-                        destination.Add(new GizmoChannelSnapshot(name, counter.LastFrameCount, counter.TimedCount));
+                    ChannelCounter counter = _activeCounters[i];
+                    destination.Add(new GizmoChannelSnapshot(counter.Name, counter.LastFrameCount, counter.TimedCount));
                 }
             }
         }
@@ -577,8 +588,8 @@ namespace Apotheosis.DebugTool.Gizmos
                 TimedCount = 0;
                 TimedOverflowed = false;
 
-                foreach (ChannelCounter counter in _channels.Values)
-                    counter.TimedCount = 0;
+                for (int i = 0; i < _activeCounters.Count; i++)
+                    _activeCounters[i].TimedCount = 0;
             }
         }
 
@@ -597,8 +608,9 @@ namespace Apotheosis.DebugTool.Gizmos
                 _radials.ClearTimed();
                 _labels.ClearTimed();
 
-                foreach (ChannelCounter counter in _channels.Values)
+                for (int i = 0; i < _activeCounters.Count; i++)
                 {
+                    ChannelCounter counter = _activeCounters[i];
                     counter.WritingFrameCount = 0;
                     counter.ActiveFrameCount = 0;
                     counter.PendingOverlayCount = 0;
@@ -632,8 +644,8 @@ namespace Apotheosis.DebugTool.Gizmos
                 _framePolyVertices.Clear();
                 _overlayPolyVertices.Clear();
                 _providers.Clear();
-                _channels.Clear();
-                _sortedChannelNames.Clear();
+                _countersById.Clear();
+                _activeCounters.Clear();
 
                 ProviderCount = 0;
                 TimedCount = 0;
@@ -661,10 +673,8 @@ namespace Apotheosis.DebugTool.Gizmos
             float duration,
             string? channel) where TPayload : struct
         {
-            string ch = NormalizeChannel(channel);
             int limit = GetCommandLimit();
             float safeDuration = SanitizeDuration(duration);
-            GizmoMeta meta = CreateMeta(ch, color, thickness, safeDuration);
 
             if (safeDuration > 0f)
             {
@@ -674,13 +684,14 @@ namespace Apotheosis.DebugTool.Gizmos
                     return;
                 }
 
-                track.AddTimed(in meta, in payload);
-                EnsureChannelLocked(ch).TimedCount++;
+                ChannelCounter timedCounter = EnsureChannelLocked(NormalizeChannel(channel));
+                GizmoMeta timedMeta = CreateMeta(timedCounter.ChannelId, color, thickness, safeDuration);
+                track.AddTimed(in timedMeta, in payload);
+                timedCounter.TimedCount++;
                 TimedCount = TotalTimedCountLocked();
                 return;
             }
 
-            ChannelCounter counter = EnsureChannelLocked(ch);
             if (ShouldRouteToOverlayLocked())
             {
                 if (TotalOverlayCountLocked() >= limit)
@@ -689,8 +700,10 @@ namespace Apotheosis.DebugTool.Gizmos
                     return;
                 }
 
-                track.AddOverlay(in meta, in payload);
-                counter.PendingOverlayCount++;
+                ChannelCounter overlayCounter = EnsureChannelLocked(NormalizeChannel(channel));
+                GizmoMeta overlayMeta = CreateMeta(overlayCounter.ChannelId, color, thickness, safeDuration);
+                track.AddOverlay(in overlayMeta, in payload);
+                overlayCounter.PendingOverlayCount++;
             }
             else
             {
@@ -700,8 +713,10 @@ namespace Apotheosis.DebugTool.Gizmos
                     return;
                 }
 
-                track.AddWriting(in meta, in payload);
-                counter.WritingFrameCount++;
+                ChannelCounter frameCounter = EnsureChannelLocked(NormalizeChannel(channel));
+                GizmoMeta frameMeta = CreateMeta(frameCounter.ChannelId, color, thickness, safeDuration);
+                track.AddWriting(in frameMeta, in payload);
+                frameCounter.WritingFrameCount++;
             }
         }
 
@@ -724,8 +739,9 @@ namespace Apotheosis.DebugTool.Gizmos
             _activeFrameOverflowed = _writingFrameOverflowed;
             _writingFrameOverflowed = false;
 
-            foreach (ChannelCounter counter in _channels.Values)
+            for (int i = 0; i < _activeCounters.Count; i++)
             {
+                ChannelCounter counter = _activeCounters[i];
                 counter.ActiveFrameCount = counter.WritingFrameCount;
                 counter.WritingFrameCount = 0;
             }
@@ -740,8 +756,8 @@ namespace Apotheosis.DebugTool.Gizmos
             _labels.ClearWriting();
             _writingPolyVertices.Clear();
 
-            foreach (ChannelCounter counter in _channels.Values)
-                counter.WritingFrameCount = 0;
+            for (int i = 0; i < _activeCounters.Count; i++)
+                _activeCounters[i].WritingFrameCount = 0;
         }
 
         private void ClearFrameTracksLocked()
@@ -753,8 +769,8 @@ namespace Apotheosis.DebugTool.Gizmos
             _labels.ClearFrame();
             _framePolyVertices.Clear();
 
-            foreach (ChannelCounter counter in _channels.Values)
-                counter.ActiveFrameCount = 0;
+            for (int i = 0; i < _activeCounters.Count; i++)
+                _activeCounters[i].ActiveFrameCount = 0;
         }
 
         private void ClearOverlayTracksLocked()
@@ -766,8 +782,8 @@ namespace Apotheosis.DebugTool.Gizmos
             _labels.ClearOverlay();
             _overlayPolyVertices.Clear();
 
-            foreach (ChannelCounter counter in _channels.Values)
-                counter.PendingOverlayCount = 0;
+            for (int i = 0; i < _activeCounters.Count; i++)
+                _activeCounters[i].PendingOverlayCount = 0;
         }
 
         private int TotalWritingCountLocked()
@@ -783,27 +799,32 @@ namespace Apotheosis.DebugTool.Gizmos
 
         private ChannelCounter EnsureChannelLocked(string channel)
         {
-            if (!_channels.TryGetValue(channel, out ChannelCounter? counter))
+            ushort id = _settings.GetOrRegisterChannel(channel);
+            while (_countersById.Count <= id)
+                _countersById.Add(null);
+
+            ChannelCounter? counter = _countersById[id];
+            if (counter is null)
             {
-                counter = new ChannelCounter();
-                _channels[channel] = counter;
-                _sortedChannelNames.Add(channel);
+                string canonicalName = _settings.TryGetChannelName(id) ?? channel;
+                counter = new ChannelCounter(id, canonicalName);
+                _countersById[id] = counter;
+                _activeCounters.Add(counter);
                 _channelListDirty = true;
-                _settings.IsChannelEnabled(channel);
             }
 
             return counter;
         }
 
-        private void DecrementChannelTimedLocked(string channel)
+        private void DecrementChannelTimedLocked(ushort channelId)
         {
-            if (_channels.TryGetValue(channel, out ChannelCounter? counter) && counter.TimedCount > 0)
+            if (channelId < _countersById.Count && _countersById[channelId] is { TimedCount: > 0 } counter)
                 counter.TimedCount--;
         }
 
-        private static GizmoMeta CreateMeta(string channel, Color color, float thickness, float safeDuration) => new()
+        private static GizmoMeta CreateMeta(ushort channelId, Color color, float thickness, float safeDuration) => new()
         {
-            Channel = channel,
+            ChannelId = channelId,
             Color = color,
             Thickness = float.IsFinite(thickness) ? MathF.Max(0.5f, thickness) : 1.5f,
             RemainingDuration = safeDuration,

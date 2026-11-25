@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using Apotheosis.Runtime.Foundation.Collections;
 using Apotheosis.Runtime.Rendering.Geometry;
 using Apotheosis.Runtime.Rendering.Materials;
 using Apotheosis.Runtime.Rendering.States;
@@ -21,12 +22,12 @@ namespace Apotheosis.Runtime.Rendering.Commands
         private const int InitialVertexCapacity = 1024;
         private const int InitialIndexCapacity = 4096;
         private const int InitialInstanceCapacity = 256;
+        private const int MaxIdleSpriteSlots = 512;
 
         private sealed class CommandBucket
         {
             public readonly object Lock = new();
-            public RenderCommand[] Commands = new RenderCommand[InitialCommandCapacity];
-            public int Count;
+            public ValueBuffer<RenderCommand> Commands = new(InitialCommandCapacity, InitialCommandCapacity);
         }
 
         private struct SpriteBucketSlot
@@ -47,24 +48,20 @@ namespace Apotheosis.Runtime.Rendering.Commands
         // 按 RenderTiming 独立分桶的 2D 精灵复用池：Flush 时原子摘取当前批，彻底消除工作线程读写竞态与同帧漏绘
         private readonly object _spriteLock = new();
         private readonly SpriteTimingBucket[] _spriteBuckets;
-        private readonly Stack<SpriteBucketSlot> _idleSpriteSlots = new();
+        private readonly BoundedObjectPool<SpriteBucketSlot> _idleSpriteSlots = new(32, MaxIdleSpriteSlots);
         private readonly List<SpriteBucketSlot> _flushingSpriteSlots = new();
 
         // 主线程 Flush 专用 CPU 聚拢缓冲（按峰值常驻复用，稳态 0 GC）
-        private RenderCommand[] _sortScratch = new RenderCommand[InitialCommandCapacity];
-        private DrawBatch[] _batches = new DrawBatch[InitialBatchCapacity];
-        private int _batchCount;
-        private UnifiedVertex[] _uploadVerts = new UnifiedVertex[InitialVertexCapacity];
-        private int _uploadVertCount;
-        private int[] _uploadIndices = new int[InitialIndexCapacity];
-        private int _uploadIndexCount;
-        private InstanceData[] _uploadInstances = new InstanceData[InitialInstanceCapacity];
-        private int _uploadInstanceCount;
+        private ValueBuffer<RenderCommand> _sortScratch = new(InitialCommandCapacity, InitialCommandCapacity);
+        private ValueBuffer<DrawBatch> _batches = new(InitialBatchCapacity, InitialBatchCapacity);
+        private ValueBuffer<UnifiedVertex> _uploadVerts = new(InitialVertexCapacity, InitialVertexCapacity);
+        private ValueBuffer<int> _uploadIndices = new(InitialIndexCapacity, InitialIndexCapacity);
+        private ValueBuffer<InstanceData> _uploadInstances = new(InitialInstanceCapacity, InitialInstanceCapacity);
 
-        // 主线程共享 GPU 动态环形缓冲
-        private DynamicVertexBuffer? _gpuVertexBuffer;
-        private DynamicIndexBuffer? _gpuIndexBuffer;
-        private DynamicVertexBuffer? _gpuInstanceBuffer;
+        // 主线程共享 GPU 动态缓冲
+        private readonly DynamicGpuVertexBuffer<UnifiedVertex> _gpuVertexBuffer = new(UnifiedVertex.Declaration, InitialVertexCapacity);
+        private readonly DynamicGpuIndexBuffer<int> _gpuIndexBuffer = new(IndexElementSize.ThirtyTwoBits, InitialIndexCapacity);
+        private readonly DynamicGpuVertexBuffer<InstanceData> _gpuInstanceBuffer = new(InstanceData.Declaration, InitialInstanceCapacity);
         private readonly VertexBufferBinding[] _instancedBindings = new VertexBufferBinding[2];
 
         // 双缓冲统计：_currentStats 记录本帧累计，EndFrame 时翻转到 _lastFrameStats 供 ImGui 稳定显示
@@ -225,7 +222,7 @@ namespace Apotheosis.Runtime.Rendering.Commands
                 CommandBucket bucket = _buckets[i];
                 lock (bucket.Lock)
                 {
-                    bucket.Count = 0;
+                    bucket.Commands.Clear(clearReferences: false);
                 }
             }
 
@@ -242,7 +239,8 @@ namespace Apotheosis.Runtime.Rendering.Commands
                         SpriteBucketSlot slot = sb.ActiveSlots[j];
                         slot.Mesh.Clear();
                         slot.BucketKey = 0;
-                        _idleSpriteSlots.Push(slot);
+                        if (!_idleSpriteSlots.Return(in slot))
+                            RenderManager.Meshes.UnregisterProtected(slot.MeshHandle);
                     }
 
                     sb.ActiveSlots.Clear();
@@ -259,15 +257,13 @@ namespace Apotheosis.Runtime.Rendering.Commands
 
             // 1. 原子摘取普通命令桶
             CommandBucket bucket = _buckets[(int)timing];
-            int count;
+            _sortScratch.Clear(clearReferences: false);
             lock (bucket.Lock)
             {
-                count = bucket.Count;
-                if (count > 0)
+                if (bucket.Commands.Count > 0)
                 {
-                    EnsureSortScratchCapacity(count);
-                    Array.Copy(bucket.Commands, _sortScratch, count);
-                    bucket.Count = 0;
+                    _sortScratch.AddRange(bucket.Commands.AsReadOnlySpan());
+                    bucket.Commands.Clear(clearReferences: false);
                 }
             }
 
@@ -285,22 +281,22 @@ namespace Apotheosis.Runtime.Rendering.Commands
             }
 
             int spriteSlotCount = _flushingSpriteSlots.Count;
-            if (count == 0 && spriteSlotCount == 0)
+            if (_sortScratch.Count == 0 && spriteSlotCount == 0)
                 return;
 
             try
             {
                 if (spriteSlotCount > 0)
                 {
-                    int totalCount = count + spriteSlotCount;
-                    EnsureSortScratchCapacity(totalCount);
+                    Span<RenderCommand> dst = _sortScratch.AllocateSpan(spriteSlotCount);
                     for (int i = 0; i < spriteSlotCount; i++)
                     {
                         SpriteBucketSlot slot = _flushingSpriteSlots[i];
-                        _sortScratch[count + i] = new RenderCommand(slot.BucketKey | slot.MeshHandle.Id);
+                        dst[i] = new RenderCommand(slot.BucketKey | slot.MeshHandle.Id);
                     }
-                    count = totalCount;
                 }
+
+                int count = _sortScratch.Count;
 
                 GraphicsDevice? gd = Main.graphics?.GraphicsDevice;
                 if (gd is null || gd.IsDisposed)
@@ -310,18 +306,18 @@ namespace Apotheosis.Runtime.Rendering.Commands
 
                 // Pass 1: 原地排序 8B RenderCommand（纯 ulong[]，L2 Cache 友好）
                 if (count > 1)
-                    Array.Sort(_sortScratch, 0, count);
+                    Array.Sort(_sortScratch.RawArray, 0, count);
 
                 // Pass 2: CPU 聚拢与合批
-                _batchCount = 0;
-                _uploadVertCount = 0;
-                _uploadIndexCount = 0;
-                _uploadInstanceCount = 0;
+                _batches.Clear(clearReferences: true);
+                _uploadVerts.Clear(clearReferences: false);
+                _uploadIndices.Clear(clearReferences: false);
+                _uploadInstances.Clear(clearReferences: false);
                 int mergedCount = 0;
 
                 GatherAndBatchCommands(gd, count, ref mergedCount);
 
-                if (_batchCount == 0)
+                if (_batches.Count == 0)
                     return;
 
                 // Pass 3: 单次上传动态 GPU Buffer + 保护原版管线状态顺序执行全部 DrawBatch
@@ -341,7 +337,7 @@ namespace Apotheosis.Runtime.Rendering.Commands
                     cur.CommandsSubmitted + count,
                     cur.DrawCallsIssued + drawCalls,
                     cur.BatchesMerged + mergedCount,
-                    cur.DynamicVertices + _uploadVertCount,
+                    cur.DynamicVertices + _uploadVerts.Count,
                     cur.PrimitivesDrawn + primitivesDrawn,
                     cur.InstancesDrawn + instancesDrawn);
             }
@@ -357,8 +353,8 @@ namespace Apotheosis.Runtime.Rendering.Commands
                             SpriteBucketSlot slot = _flushingSpriteSlots[i];
                             slot.Mesh.Clear();
                             slot.BucketKey = 0;
-                            if (!RenderManager.IsUnloading)
-                                _idleSpriteSlots.Push(slot);
+                            if (!RenderManager.IsUnloading && !_idleSpriteSlots.Return(in slot))
+                                RenderManager.Meshes.UnregisterProtected(slot.MeshHandle);
                         }
                     }
 
@@ -374,7 +370,7 @@ namespace Apotheosis.Runtime.Rendering.Commands
                 CommandBucket bucket = _buckets[i];
                 lock (bucket.Lock)
                 {
-                    bucket.Count = 0;
+                    bucket.Commands.Clear(clearReferences: false);
                 }
             }
 
@@ -390,35 +386,17 @@ namespace Apotheosis.Runtime.Rendering.Commands
                 _flushingSpriteSlots.Clear();
             }
 
-            Array.Clear(_batches, 0, _batchCount);
-            _batchCount = 0;
-            _uploadVertCount = 0;
-            _uploadIndexCount = 0;
-            _uploadInstanceCount = 0;
+            _sortScratch.Clear(clearReferences: false);
+            _batches.Clear(clearReferences: true);
+            _uploadVerts.Clear(clearReferences: false);
+            _uploadIndices.Clear(clearReferences: false);
+            _uploadInstances.Clear(clearReferences: false);
             Array.Clear(_currentStats, 0, _currentStats.Length);
             Array.Clear(_lastFrameStats, 0, _lastFrameStats.Length);
 
-            DynamicVertexBuffer? vb = _gpuVertexBuffer;
-            DynamicIndexBuffer? ib = _gpuIndexBuffer;
-            DynamicVertexBuffer? instVb = _gpuInstanceBuffer;
-            _gpuVertexBuffer = null;
-            _gpuIndexBuffer = null;
-            _gpuInstanceBuffer = null;
-
-            if (vb is not null || ib is not null || instVb is not null)
-            {
-                void DisposeGpuBuffers()
-                {
-                    try { vb?.Dispose(); } catch { }
-                    try { ib?.Dispose(); } catch { }
-                    try { instVb?.Dispose(); } catch { }
-                }
-
-                if (RenderManager.Shaders.IsOnMainThread)
-                    DisposeGpuBuffers();
-                else
-                    Main.QueueMainThreadAction(DisposeGpuBuffers);
-            }
+            _gpuVertexBuffer.DisposeOnMainThread();
+            _gpuIndexBuffer.DisposeOnMainThread();
+            _gpuInstanceBuffer.DisposeOnMainThread();
         }
 
         // ==================== Pass 2: Gather & Batch ====================
@@ -459,11 +437,11 @@ namespace Apotheosis.Runtime.Rendering.Commands
                         if (basePrimCount <= 0 || !baseStatic.EnsureGpuReady(gd))
                             continue;
 
-                        int instOffset = AppendInstances(instSpan);
+                        int instOffset = _uploadInstances.AddRange(instSpan);
 
-                        if (_batchCount > 0)
+                        if (_batches.Count > 0)
                         {
-                            ref DrawBatch prev = ref _batches[_batchCount - 1];
+                            ref DrawBatch prev = ref _batches[_batches.Count - 1];
                             if (prev.Kind == DrawBatchKind.Instanced
                                 && prev.BatchKey == cmd.BatchKey
                                 && prev.BaseMeshHandle == baseHandle
@@ -475,7 +453,7 @@ namespace Apotheosis.Runtime.Rendering.Commands
                             }
                         }
 
-                        ref DrawBatch batch = ref AddBatch();
+                        ref DrawBatch batch = ref _batches.AddRef();
                         batch.Kind = DrawBatchKind.Instanced;
                         batch.Target = cmd.Target;
                         batch.Material = cmd.Material;
@@ -499,7 +477,7 @@ namespace Apotheosis.Runtime.Rendering.Commands
                     if (primCount <= 0 || !staticMesh.EnsureGpuReady(gd))
                         continue;
 
-                    ref DrawBatch batch = ref AddBatch();
+                    ref DrawBatch batch = ref _batches.AddRef();
                     batch.Kind = DrawBatchKind.StaticIndexed;
                     batch.Target = cmd.Target;
                     batch.Material = cmd.Material;
@@ -542,9 +520,9 @@ namespace Apotheosis.Runtime.Rendering.Commands
                 };
 
                 // TriangleList 与 LineList 且索引严格连续时跨 Mesh 自动合批
-                if (indicesPerPrim > 0 && _batchCount > 0)
+                if (indicesPerPrim > 0 && _batches.Count > 0)
                 {
-                    ref DrawBatch prev = ref _batches[_batchCount - 1];
+                    ref DrawBatch prev = ref _batches[_batches.Count - 1];
                     if (prev.Kind == DrawBatchKind.DynamicIndexed
                         && prev.PrimitiveType == primType
                         && prev.BatchKey == cmd.BatchKey
@@ -556,7 +534,7 @@ namespace Apotheosis.Runtime.Rendering.Commands
                     }
                 }
 
-                ref DrawBatch dynBatch = ref AddBatch();
+                ref DrawBatch dynBatch = ref _batches.AddRef();
                 dynBatch.Kind = DrawBatchKind.DynamicIndexed;
                 dynBatch.Target = cmd.Target;
                 dynBatch.Material = cmd.Material;
@@ -572,37 +550,14 @@ namespace Apotheosis.Runtime.Rendering.Commands
 
         private void UploadDynamicBuffers(GraphicsDevice gd)
         {
-            if (_uploadVertCount > 0 && _uploadIndexCount > 0)
+            if (_uploadVerts.Count > 0 && _uploadIndices.Count > 0)
             {
-                if (_gpuVertexBuffer is null || _gpuVertexBuffer.IsDisposed || _gpuVertexBuffer.VertexCount < _uploadVertCount)
-                {
-                    _gpuVertexBuffer?.Dispose();
-                    int newCap = (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)Math.Max(_uploadVertCount, InitialVertexCapacity));
-                    _gpuVertexBuffer = new DynamicVertexBuffer(gd, UnifiedVertex.Declaration, newCap, BufferUsage.WriteOnly);
-                }
-
-                if (_gpuIndexBuffer is null || _gpuIndexBuffer.IsDisposed || _gpuIndexBuffer.IndexCount < _uploadIndexCount)
-                {
-                    _gpuIndexBuffer?.Dispose();
-                    int newCap = (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)Math.Max(_uploadIndexCount, InitialIndexCapacity));
-                    _gpuIndexBuffer = new DynamicIndexBuffer(gd, IndexElementSize.ThirtyTwoBits, newCap, BufferUsage.WriteOnly);
-                }
-
-                _gpuVertexBuffer.SetData(_uploadVerts, 0, _uploadVertCount, SetDataOptions.Discard);
-                _gpuIndexBuffer.SetData(_uploadIndices, 0, _uploadIndexCount, SetDataOptions.Discard);
+                _gpuVertexBuffer.UploadDiscard(gd, _uploadVerts.RawArray, _uploadVerts.Count);
+                _gpuIndexBuffer.UploadDiscard(gd, _uploadIndices.RawArray, _uploadIndices.Count);
             }
 
-            if (_uploadInstanceCount > 0)
-            {
-                if (_gpuInstanceBuffer is null || _gpuInstanceBuffer.IsDisposed || _gpuInstanceBuffer.VertexCount < _uploadInstanceCount)
-                {
-                    _gpuInstanceBuffer?.Dispose();
-                    int newCap = (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)Math.Max(_uploadInstanceCount, InitialInstanceCapacity));
-                    _gpuInstanceBuffer = new DynamicVertexBuffer(gd, InstanceData.Declaration, newCap, BufferUsage.WriteOnly);
-                }
-
-                _gpuInstanceBuffer.SetData(_uploadInstances, 0, _uploadInstanceCount, SetDataOptions.Discard);
-            }
+            if (_uploadInstances.Count > 0)
+                _gpuInstanceBuffer.UploadDiscard(gd, _uploadInstances.RawArray, _uploadInstances.Count);
         }
 
         private void ExecuteBatches(GraphicsDevice gd, ref int drawCalls, ref int primitivesDrawn, ref int instancesDrawn)
@@ -621,7 +576,8 @@ namespace Apotheosis.Runtime.Rendering.Commands
 
             try
             {
-                for (int i = 0; i < _batchCount; i++)
+                int batchCount = _batches.Count;
+                for (int i = 0; i < batchCount; i++)
                 {
                     ref readonly DrawBatch batch = ref _batches[i];
 
@@ -705,13 +661,15 @@ namespace Apotheosis.Runtime.Rendering.Commands
                     {
                         case DrawBatchKind.DynamicIndexed:
                         {
-                            if (_gpuVertexBuffer is null || _gpuIndexBuffer is null)
+                            DynamicVertexBuffer? vb = _gpuVertexBuffer.Buffer;
+                            DynamicIndexBuffer? ib = _gpuIndexBuffer.Buffer;
+                            if (vb is null || ib is null)
                                 continue;
 
                             if (!dynamicBuffersBound)
                             {
-                                gd.SetVertexBuffer(_gpuVertexBuffer);
-                                gd.Indices = _gpuIndexBuffer;
+                                gd.SetVertexBuffer(vb);
+                                gd.Indices = ib;
                                 dynamicBuffersBound = true;
                             }
 
@@ -719,7 +677,7 @@ namespace Apotheosis.Runtime.Rendering.Commands
                                 batch.PrimitiveType,
                                 baseVertex: 0,
                                 minVertexIndex: 0,
-                                numVertices: _uploadVertCount,
+                                numVertices: _uploadVerts.Count,
                                 startIndex: batch.StartIndex,
                                 primitiveCount: batch.PrimitiveCount);
 
@@ -754,11 +712,12 @@ namespace Apotheosis.Runtime.Rendering.Commands
                         case DrawBatchKind.Instanced:
                         {
                             IStaticGpuMesh? baseSm = batch.StaticMesh;
-                            if (baseSm?.VertexBuffer is null || baseSm.IndexBuffer is null || _gpuInstanceBuffer is null)
+                            DynamicVertexBuffer? instVb = _gpuInstanceBuffer.Buffer;
+                            if (baseSm?.VertexBuffer is null || baseSm.IndexBuffer is null || instVb is null)
                                 continue;
 
                             _instancedBindings[0] = new VertexBufferBinding(baseSm.VertexBuffer, vertexOffset: 0, instanceFrequency: 0);
-                            _instancedBindings[1] = new VertexBufferBinding(_gpuInstanceBuffer, vertexOffset: batch.InstanceOffset, instanceFrequency: 1);
+                            _instancedBindings[1] = new VertexBufferBinding(instVb, vertexOffset: batch.InstanceOffset, instanceFrequency: 1);
                             gd.SetVertexBuffers(_instancedBindings);
                             gd.Indices = baseSm.IndexBuffer;
                             dynamicBuffersBound = false;
@@ -789,18 +748,11 @@ namespace Apotheosis.Runtime.Rendering.Commands
                 if (switchedOffscreen)
                     offscreenScope.Dispose();
 
-                Array.Clear(_batches, 0, _batchCount);
-                _batchCount = 0;
+                _batches.Clear(clearReferences: true);
             }
         }
 
         // ==================== 内部辅助 ====================
-
-        private void EnsureSortScratchCapacity(int required)
-        {
-            if (_sortScratch.Length < required)
-                _sortScratch = new RenderCommand[Math.Max(required, _sortScratch.Length * 2)];
-        }
 
         private void EnqueueCommand(RenderTiming timing, RenderCommand cmd)
         {
@@ -810,49 +762,26 @@ namespace Apotheosis.Runtime.Rendering.Commands
                 if (RenderManager.IsUnloading)
                     return;
 
-                if (bucket.Count >= bucket.Commands.Length)
-                    Array.Resize(ref bucket.Commands, bucket.Commands.Length * 2);
-
-                bucket.Commands[bucket.Count++] = cmd;
+                bucket.Commands.Add(in cmd);
             }
         }
 
         private SpriteBucketSlot AcquireIdleSpriteSlotLocked(ulong bucketKey)
         {
-            if (_idleSpriteSlots.Count > 0)
+            if (_idleSpriteSlots.TryPop(out SpriteBucketSlot recycled))
             {
-                SpriteBucketSlot recycled = _idleSpriteSlots.Pop();
                 recycled.BucketKey = bucketKey;
                 return recycled;
             }
 
             var mesh = new DynamicMesh(initialVertexCapacity: 64, initialIndexCapacity: 96, PrimitiveType.TriangleList);
             MeshHandle handle = RenderManager.Meshes.RegisterProtected(mesh);
-            return new SpriteBucketSlot
-            {
-                BucketKey = bucketKey,
-                MeshHandle = handle,
-                Mesh = mesh,
-            };
-        }
-
-        private ref DrawBatch AddBatch()
-        {
-            if (_batchCount >= _batches.Length)
-                Array.Resize(ref _batches, _batches.Length * 2);
-
-            ref DrawBatch b = ref _batches[_batchCount++];
-            b = default;
-            return ref b;
+            return new SpriteBucketSlot { BucketKey = bucketKey, MeshHandle = handle, Mesh = mesh };
         }
 
         private int AppendDynamicVertices(ReadOnlySpan<UnifiedVertex> src, IMesh mesh)
         {
-            int baseVertex = _uploadVertCount;
-            int required = baseVertex + src.Length;
-            if (required > _uploadVerts.Length)
-                Array.Resize(ref _uploadVerts, Math.Max(required, _uploadVerts.Length * 2));
-
+            int baseVertex = _uploadVerts.Allocate(src.Length, out Span<UnifiedVertex> dst);
             if (mesh.TryGetWorldMatrix(out Matrix worldMatrix))
             {
                 for (int i = 0; i < src.Length; i++)
@@ -862,49 +791,31 @@ namespace Apotheosis.Runtime.Rendering.Commands
                     Vector3 n = Vector3.TransformNormal(v.Normal, worldMatrix);
                     float lenSq = n.LengthSquared();
                     v.Normal = lenSq > 1e-6f ? n / MathF.Sqrt(lenSq) : v.Normal;
-                    _uploadVerts[baseVertex + i] = v;
+                    dst[i] = v;
                 }
             }
             else
             {
-                src.CopyTo(_uploadVerts.AsSpan(baseVertex, src.Length));
+                src.CopyTo(dst);
             }
 
-            _uploadVertCount = required;
             return baseVertex;
         }
 
         private int AppendRebasedIndices(ReadOnlySpan<int> src, int baseVertex)
         {
-            int startIndex = _uploadIndexCount;
-            int required = startIndex + src.Length;
-            if (required > _uploadIndices.Length)
-                Array.Resize(ref _uploadIndices, Math.Max(required, _uploadIndices.Length * 2));
-
+            int startIndex = _uploadIndices.Allocate(src.Length, out Span<int> dst);
             if (baseVertex == 0)
             {
-                src.CopyTo(_uploadIndices.AsSpan(startIndex, src.Length));
+                src.CopyTo(dst);
             }
             else
             {
                 for (int i = 0; i < src.Length; i++)
-                    _uploadIndices[startIndex + i] = src[i] + baseVertex;
+                    dst[i] = src[i] + baseVertex;
             }
 
-            _uploadIndexCount = required;
             return startIndex;
-        }
-
-        private int AppendInstances(ReadOnlySpan<InstanceData> src)
-        {
-            int offset = _uploadInstanceCount;
-            int required = offset + src.Length;
-            if (required > _uploadInstances.Length)
-                Array.Resize(ref _uploadInstances, Math.Max(required, _uploadInstances.Length * 2));
-
-            src.CopyTo(_uploadInstances.AsSpan(offset, src.Length));
-            _uploadInstanceCount = required;
-            return offset;
         }
 
         private static int CalculatePrimitiveCount(PrimitiveType type, int indexCount)
