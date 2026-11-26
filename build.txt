@@ -2,4 +2,5 @@ displayName = Apotheosis
 displayName.zh-Hans = Apotheosis
 author = YumeiL
 version = 0.1
-buildIgnore = Generator\*, Tools\*, DebugTool\*, *.fx, *.fxh, *.hlsl, *.slnx, *.sln, *.csproj, *.user, .idea\*, .vs\*, .git\*, .gitignore, bin\*, obj\*, *.md
+dllReferences = Friflo.Engine.ECS, Friflo.Json.Fliox, Friflo.Json.Burst, Friflo.Json.Fliox.Annotation
+buildIgnore = Generator\*, Tools\*, DebugTool\*, lib\*.xml, *.fx, *.fxh, *.hlsl, *.slnx, *.sln, *.csproj, *.user, .idea\*, .vs\*, .git\*, .gitignore, bin\*, obj\*, *.md

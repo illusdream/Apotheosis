@@ -70,6 +70,9 @@ namespace Apotheosis.Runtime.Rendering
             }
         }
 
+        /// <summary>每渲染帧开始前在主线程触发的通用提交事件。</summary>
+        public static event Action? OnPreDrawSubmit;
+
         /// <summary>当前渲染帧号。</summary>
         public static ulong FrameId => Volatile.Read(ref _frameCounter);
 
@@ -147,6 +150,7 @@ namespace Apotheosis.Runtime.Rendering
 
             lock (_lifecycleLock)
             {
+                OnPreDrawSubmit = null;
 #if DEBUG
                 _shaderHotReloader?.Dispose();
                 _shaderHotReloader = null;
@@ -184,6 +188,7 @@ namespace Apotheosis.Runtime.Rendering
             if (_unloading)
                 return;
 
+            Action? submitHandlers;
             lock (_lifecycleLock)
             {
                 if (_unloading)
@@ -196,7 +201,12 @@ namespace Apotheosis.Runtime.Rendering
                 _frameCounter++;
                 _lastDeltaTime = (float)gameTime.ElapsedGameTime.TotalSeconds;
                 _contextCaptured = false;
+                submitHandlers = OnPreDrawSubmit;
             }
+
+            // 锁外触发帧前提交事件，避免订阅方内部持锁或提交命令引发锁序死锁
+            if (!_unloading)
+                submitHandlers?.Invoke();
         }
 
         private static void Hook_DoDraw(On_Main.orig_DoDraw orig, Main self, GameTime gameTime)

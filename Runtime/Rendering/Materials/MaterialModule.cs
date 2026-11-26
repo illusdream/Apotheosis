@@ -23,12 +23,14 @@ namespace Apotheosis.Runtime.Rendering.Materials
             public readonly Texture2D Texture;
             public readonly BlendState Blend;
             public readonly SamplerState Sampler;
+            public readonly bool IsInstanced;
 
-            public SpriteMaterialKey(Texture2D texture, BlendState blend, SamplerState sampler)
+            public SpriteMaterialKey(Texture2D texture, BlendState blend, SamplerState sampler, bool isInstanced)
             {
                 Texture = texture;
                 Blend = blend;
                 Sampler = sampler;
+                IsInstanced = isInstanced;
             }
         }
 
@@ -37,10 +39,10 @@ namespace Apotheosis.Runtime.Rendering.Materials
             public static readonly SpriteMaterialKeyComparer Instance = new();
 
             public bool Equals(SpriteMaterialKey x, SpriteMaterialKey y)
-                => ReferenceEquals(x.Texture, y.Texture) && ReferenceEquals(x.Blend, y.Blend) && ReferenceEquals(x.Sampler, y.Sampler);
+                => x.IsInstanced == y.IsInstanced && ReferenceEquals(x.Texture, y.Texture) && ReferenceEquals(x.Blend, y.Blend) && ReferenceEquals(x.Sampler, y.Sampler);
 
             public int GetHashCode(SpriteMaterialKey obj)
-                => HashCode.Combine(RuntimeHelpers.GetHashCode(obj.Texture), RuntimeHelpers.GetHashCode(obj.Blend), RuntimeHelpers.GetHashCode(obj.Sampler));
+                => HashCode.Combine(RuntimeHelpers.GetHashCode(obj.Texture), RuntimeHelpers.GetHashCode(obj.Blend), RuntimeHelpers.GetHashCode(obj.Sampler), obj.IsInstanced);
         }
 
         private readonly object _lock = new();
@@ -98,12 +100,19 @@ namespace Apotheosis.Runtime.Rendering.Materials
 
         /// <summary>获取或创建指定贴图与采样/混合状态对应的 2D 精灵材质。</summary>
         public MaterialHandle GetOrCreateSpriteMaterial(Texture2D texture, BlendState? blendState = null, SamplerState? samplerState = null)
+            => GetOrCreateDefaultBatchMaterial(texture, blendState, samplerState, isInstanced: false);
+
+        /// <summary>获取或创建指定贴图与采样/混合状态对应的硬件实例化材质。</summary>
+        public MaterialHandle GetOrCreateInstancedMaterial(Texture2D texture, BlendState? blendState = null, SamplerState? samplerState = null)
+            => GetOrCreateDefaultBatchMaterial(texture, blendState, samplerState, isInstanced: true);
+
+        private MaterialHandle GetOrCreateDefaultBatchMaterial(Texture2D texture, BlendState? blendState, SamplerState? samplerState, bool isInstanced)
         {
             ArgumentNullException.ThrowIfNull(texture);
 
             BlendState blend = blendState ?? BlendState.AlphaBlend;
             SamplerState sampler = samplerState ?? SamplerState.LinearClamp;
-            var key = new SpriteMaterialKey(texture, blend, sampler);
+            var key = new SpriteMaterialKey(texture, blend, sampler, isInstanced);
 
             lock (_lock)
             {
@@ -113,9 +122,11 @@ namespace Apotheosis.Runtime.Rendering.Materials
                 if (_spriteMaterialCache.TryGetValue(key, out MaterialHandle cached))
                     return cached;
 
+                int techIndex = isInstanced ? Core_DefaultBatchShader.Technique_InstancedTech : Core_DefaultBatchShader.Technique_StandardTech;
+                int passIndex = isInstanced ? Core_DefaultBatchShader.Pass_InstancedTech_DefaultPass : Core_DefaultBatchShader.Pass_StandardTech_DefaultPass;
+
                 // 先完整配置贴图再发布到槽位表，避免并发读线程观察到未绑定贴图的半成品材质
-                MaterialHandle handle = CreateLocked(Assets.Shaders.Core.DefaultBatch,
-                    Core_DefaultBatchShader.Technique_StandardTech, Core_DefaultBatchShader.Pass_StandardTech_DefaultPass,
+                MaterialHandle handle = CreateLocked(Assets.Shaders.Core.DefaultBatch, techIndex, passIndex,
                     blend, DepthStencilState.None, RasterizerState.CullNone, sampler,
                     fallbackToMagicPixel: true, protectFromExternalRelease: true,
                     initialTextureSlot: Core_DefaultBatchShader.Slot_uImage0, initialTexture: texture);

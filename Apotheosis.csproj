@@ -108,6 +108,18 @@
 
 	<!-- References -->
 	<ItemGroup>
+		<Reference Include="Friflo.Engine.ECS">
+			<HintPath>lib\Friflo.Engine.ECS.dll</HintPath>
+		</Reference>
+		<Reference Include="Friflo.Json.Fliox">
+			<HintPath>lib\Friflo.Json.Fliox.dll</HintPath>
+		</Reference>
+		<Reference Include="Friflo.Json.Burst">
+			<HintPath>lib\Friflo.Json.Burst.dll</HintPath>
+		</Reference>
+		<Reference Include="Friflo.Json.Fliox.Annotation">
+			<HintPath>lib\Friflo.Json.Fliox.Annotation.dll</HintPath>
+		</Reference>
 		<ProjectReference Include="Generator\Apotheosis.Generator.csproj"
 		                  OutputItemType="Analyzer"
 		                  ReferenceOutputAssembly="false" />
