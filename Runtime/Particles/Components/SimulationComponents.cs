@@ -296,6 +296,9 @@ namespace Apotheosis.Runtime.Particles.Components
         /// <summary>当前已发生的反弹次数。</summary>
         public byte BounceCount;
 
+        // 填充 1 字节对齐空隙：记录 Stick 模式下黏附的接触面位掩码（支撑物块被挖除时自动解除黏附）
+        internal byte StuckMask;
+
         public ParticleTileCollision() : this(ParticleTileCollisionMode.Bounce) { }
 
         public ParticleTileCollision(ParticleTileCollisionMode mode, float restitution = 0.5f, float friction = 0.2f, float radius = 2f, byte maxBounces = 0)
@@ -306,6 +309,7 @@ namespace Apotheosis.Runtime.Particles.Components
             Radius = radius;
             MaxBounces = maxBounces;
             BounceCount = 0;
+            StuckMask = 0;
         }
     }
 

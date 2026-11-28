@@ -3,6 +3,7 @@
 using System;
 using System.Runtime.ExceptionServices;
 using System.Threading;
+using Apotheosis.Runtime.Particles.Fields;
 using Apotheosis.Runtime.Particles.Systems;
 
 namespace Apotheosis.Runtime.Particles.Core
@@ -16,13 +17,15 @@ namespace Apotheosis.Runtime.Particles.Core
 
         public ParticlePipeline()
         {
-            // 按固定物理顺序装配默认模拟管线（LifeSystem 居首清理到期粒子，VelocityAlign 紧随 ScaleOverLife 之后）
+            // 按固定物理顺序装配默认模拟管线（Life 居首，Gravity/ForceField/Drag 施加受力，Integrate 积分，TileCollision 地形响应，随后视觉曲线与动画）
             _simSystems = new IParticleSimSystem[]
             {
                 new ParticleLifeSystem(),
                 new ParticleGravitySystem(),
+                new ParticleForceFieldSystem(),
                 new ParticleDragSystem(),
                 new ParticleMotionIntegrateSystem(),
+                new ParticleTileCollisionSystem(),
                 new ParticleColorOverLifeSystem(),
                 new ParticleScaleOverLifeSystem(),
                 new ParticleVelocityAlignSystem(),
@@ -63,16 +66,17 @@ namespace Apotheosis.Runtime.Particles.Core
             }
         }
 
-        public void StepSimulation(ParticleStoreSlot globalSlot, ReadOnlySpan<ParticleInstance> activeInstances, float deltaTime, bool isWorldPaused, bool isGameMenu)
+        public void StepSimulation(ParticleStoreSlot globalSlot, ReadOnlySpan<ParticleInstance> activeInstances, float deltaTime, float simulationTime,
+            ReadOnlySpan<ForceFieldData> globalFields, bool isWorldPaused, bool isGameMenu)
         {
             IParticleSimSystem[] sims = Volatile.Read(ref _simSystems);
-            if (sims.Length == 0 || !(deltaTime > 0f))
+            if (sims.Length == 0 || !float.IsFinite(deltaTime) || !(deltaTime > 0f))
                 return;
 
             bool stepWorld = !isWorldPaused && !isGameMenu;
             if (stepWorld && globalSlot.EntityCount > 0)
             {
-                ParticleSimContext globalCtx = ParticleSimContext.ForGlobalWorld(deltaTime);
+                ParticleSimContext globalCtx = ParticleSimContext.ForGlobalWorld(deltaTime, simulationTime, globalFields);
                 for (int s = 0; s < sims.Length; s++)
                     sims[s].Execute(globalSlot, in globalCtx);
             }
@@ -88,10 +92,10 @@ namespace Apotheosis.Runtime.Particles.Core
                     continue;
 
                 float effectiveDt = deltaTime * inst.TimeScale;
-                if (!(effectiveDt > 0f))
+                if (!float.IsFinite(effectiveDt) || !(effectiveDt > 0f))
                     continue;
 
-                ParticleSimContext instCtx = ParticleSimContext.ForInstance(inst, effectiveDt);
+                ParticleSimContext instCtx = ParticleSimContext.ForInstance(inst, effectiveDt, simulationTime, globalFields, inst.GetLocalFieldsSpan());
                 for (int s = 0; s < sims.Length; s++)
                     sims[s].Execute(slot, in instCtx);
             }

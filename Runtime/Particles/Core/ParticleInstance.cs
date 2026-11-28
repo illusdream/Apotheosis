@@ -2,7 +2,9 @@
 
 using System;
 using System.Collections.Generic;
+using Apotheosis.Runtime.Foundation.Collections;
 using Apotheosis.Runtime.Particles.Emitters;
+using Apotheosis.Runtime.Particles.Fields;
 using Apotheosis.Runtime.Rendering.Targets;
 
 namespace Apotheosis.Runtime.Particles.Core
@@ -102,6 +104,11 @@ namespace Apotheosis.Runtime.Particles.Core
         private readonly List<MountedEmitterEntry> _emitters = new(2);
         private bool _stopIfNoEmittersRemain;
 
+        // 仅由粒子工作线程独占访问的子系统专属局部力场列表与连续数据缓存
+        private readonly List<ActiveForceFieldEntry> _localFields = new(2);
+        private ValueBuffer<ForceFieldData> _localFieldDataCache = new(4, 4);
+        private bool _localFieldsDirty;
+
         /// <summary>对外公开的代际安全句柄。</summary>
         public ParticleSystemHandle Handle { get; private set; }
 
@@ -165,6 +172,7 @@ namespace Apotheosis.Runtime.Particles.Core
             AutoStopWhenEmittersComplete = false;
             _stopIfNoEmittersRemain = false;
             _emitters.Clear();
+            ClearLocalFieldsOnWorker();
             State = ParticleInstanceState.Active;
         }
 
@@ -335,6 +343,101 @@ namespace Apotheosis.Runtime.Particles.Core
             AutoStopWhenEmittersComplete = anyAutoStop;
         }
 
+        internal void AddLocalFieldOnWorker(uint fieldId, in ForceFieldData data, float duration)
+        {
+            if (State != ParticleInstanceState.Active || fieldId == 0)
+                return;
+
+            bool hasDuration = float.IsFinite(duration) && duration > 0f;
+            _localFields.Add(new ActiveForceFieldEntry
+            {
+                FieldId = fieldId,
+                Data = data,
+                RemainingDuration = hasDuration ? duration : 0f,
+                HasDuration = hasDuration,
+            });
+            _localFieldsDirty = true;
+        }
+
+        internal void UpdateLocalFieldOnWorker(uint fieldId, in ForceFieldData data)
+        {
+            for (int i = 0; i < _localFields.Count; i++)
+            {
+                if (_localFields[i].FieldId != fieldId)
+                    continue;
+
+                ActiveForceFieldEntry entry = _localFields[i];
+                entry.Data = data;
+                _localFields[i] = entry;
+                _localFieldsDirty = true;
+                return;
+            }
+        }
+
+        internal void RemoveLocalFieldOnWorker(uint fieldId)
+        {
+            for (int i = 0; i < _localFields.Count; i++)
+            {
+                if (_localFields[i].FieldId != fieldId)
+                    continue;
+
+                _localFields.RemoveAt(i);
+                _localFieldsDirty = true;
+                return;
+            }
+        }
+
+        internal void TickLocalFieldDurationsOnWorker(float effectiveDt)
+        {
+            if (_localFields.Count == 0 || !(effectiveDt > 0f))
+                return;
+
+            for (int i = _localFields.Count - 1; i >= 0; i--)
+            {
+                ActiveForceFieldEntry entry = _localFields[i];
+                if (!entry.HasDuration)
+                    continue;
+
+                entry.RemainingDuration -= effectiveDt;
+                if (!(entry.RemainingDuration > 0f))
+                {
+                    _localFields.RemoveAt(i);
+                    _localFieldsDirty = true;
+                }
+                else
+                {
+                    _localFields[i] = entry;
+                }
+            }
+        }
+
+        internal ReadOnlySpan<ForceFieldData> GetLocalFieldsSpan()
+        {
+            if (_localFields.Count == 0)
+                return ReadOnlySpan<ForceFieldData>.Empty;
+
+            if (_localFieldsDirty)
+            {
+                _localFieldDataCache.Clear(clearReferences: false);
+                for (int i = 0; i < _localFields.Count; i++)
+                {
+                    ForceFieldData d = _localFields[i].Data;
+                    _localFieldDataCache.Add(in d);
+                }
+
+                _localFieldsDirty = false;
+            }
+
+            return _localFieldDataCache.AsReadOnlySpan();
+        }
+
+        internal void ClearLocalFieldsOnWorker()
+        {
+            _localFields.Clear();
+            _localFieldDataCache.Clear(clearReferences: false);
+            _localFieldsDirty = false;
+        }
+
         internal void ResetForPool()
         {
             Handle = ParticleSystemHandle.Invalid;
@@ -348,6 +451,7 @@ namespace Apotheosis.Runtime.Particles.Core
             GlobalFieldMask = ParticleFieldMask.All;
             TargetOverride = null;
             ClearEmittersOnWorker();
+            ClearLocalFieldsOnWorker();
             State = ParticleInstanceState.Disposing;
         }
     }

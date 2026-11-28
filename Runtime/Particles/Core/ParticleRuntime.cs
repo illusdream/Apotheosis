@@ -8,6 +8,7 @@ using System.Threading;
 using Apotheosis.Runtime.Foundation;
 using Apotheosis.Runtime.Foundation.Collections;
 using Apotheosis.Runtime.Particles.Emitters;
+using Apotheosis.Runtime.Particles.Fields;
 using Apotheosis.Runtime.Particles.Fragments;
 using log4net;
 
@@ -40,7 +41,8 @@ namespace Apotheosis.Runtime.Particles.Core
     internal interface IParticleRuntimePipeline
     {
         /// <summary>在工作线程中执行单步模拟（依次驱动全局存储与全部活跃子系统）。</summary>
-        void StepSimulation(ParticleStoreSlot globalSlot, ReadOnlySpan<ParticleInstance> activeInstances, float deltaTime, bool isWorldPaused, bool isGameMenu);
+        void StepSimulation(ParticleStoreSlot globalSlot, ReadOnlySpan<ParticleInstance> activeInstances, float deltaTime, float simulationTime,
+            ReadOnlySpan<ForceFieldData> globalFields, bool isWorldPaused, bool isGameMenu);
 
         /// <summary>在工作线程中打包最新渲染数据并发布至三缓冲。</summary>
         void PackRenderSnapshot(ParticleStoreSlot globalSlot, ReadOnlySpan<ParticleInstance> activeInstances);
@@ -80,6 +82,10 @@ namespace Apotheosis.Runtime.Particles.Core
             DetachEmitter = 10,
             TriggerEmitterBurst = 11,
             SetInstanceTimeScale = 12,
+            AddForceField = 13,
+            UpdateForceField = 14,
+            RemoveForceField = 15,
+            ClearGlobalForceFields = 16,
         }
 
         private struct ControlCommand
@@ -91,9 +97,11 @@ namespace Apotheosis.Runtime.Particles.Core
             public ParticleOriginSnapshot InitialSnapshot;
             public ParticleHostLostPolicy DestroyPolicy;
             public uint EmitterId;
+            public uint FieldId;
             public int EmitCount;
             public float FloatValue;
             public bool BoolFlag;
+            public ForceFieldData FieldData;
             public ParticleEmitter? Blueprint;
             public IParticleEmitter? Emitter;
             public ParticleTemplate? Template;
@@ -142,6 +150,7 @@ namespace Apotheosis.Runtime.Particles.Core
         private readonly List<ushort> _activeSlotIds = new(32);
         private ushort _nextFreshSlotId = 1;
         private uint _nextEmitterId;
+        private uint _nextFieldId;
         private ValueBuffer<CustomSampleItem> _customSampleScratch = new(8, 8);
 
         private readonly object _commandLock = new();
@@ -161,6 +170,10 @@ namespace Apotheosis.Runtime.Particles.Core
         private readonly BoundedObjectPool<ParticleInstance> _instancePool = new(8, MaxPooledInstances, static () => new ParticleInstance());
         private readonly Dictionary<ushort, ParticleInstance> _workerInstanceMap = new(32);
         private readonly List<ParticleInstance> _activeInstances = new(32);
+        private readonly List<ActiveForceFieldEntry> _globalFields = new(8);
+        private ValueBuffer<ForceFieldData> _globalFieldDataCache = new(8, 8);
+        private bool _globalFieldsDirty;
+        private float _simulationTime;
         private readonly Action<string, Exception> _logWorkerExceptionCallback;
         private ParticleRandom _workerRng = new(ParticleRandom.NextSeed());
 
@@ -601,6 +614,98 @@ namespace Apotheosis.Runtime.Particles.Core
             });
         }
 
+        /// <summary>向全局世界注册一个力场并返回句柄（<paramref name="duration"/> &gt; 0 时到期自动移除，世界卸载自动清空）。</summary>
+        public ForceFieldHandle AddGlobalForceField(in ForceFieldData data, float duration = 0f)
+        {
+            if (!_started || _stopRequested || _disposed)
+                return ForceFieldHandle.Invalid;
+
+            uint fieldId = AllocateFieldId();
+            bool enqueued = EnqueueControlCommand(new ControlCommand
+            {
+                Kind = ControlCommandKind.AddForceField,
+                Domain = ParticleUpdateDomain.World,
+                Handle = ParticleSystemHandle.Invalid,
+                FieldId = fieldId,
+                FieldData = data,
+                FloatValue = duration,
+            });
+
+            return enqueued ? new ForceFieldHandle(ParticleSystemHandle.Invalid, fieldId) : ForceFieldHandle.Invalid;
+        }
+
+        /// <summary>向指定小型独立粒子子系统挂载一个专属局部力场并返回句柄（随子系统回收自动清除）。</summary>
+        public ForceFieldHandle AddInstanceForceField(ParticleSystemHandle instanceHandle, in ForceFieldData data, float duration = 0f)
+        {
+            if (!TryGetRegisteredDomain(instanceHandle, out ParticleUpdateDomain domain) || _stopRequested || _disposed)
+                return ForceFieldHandle.Invalid;
+
+            uint fieldId = AllocateFieldId();
+            bool enqueued = EnqueueControlCommand(new ControlCommand
+            {
+                Kind = ControlCommandKind.AddForceField,
+                Domain = domain,
+                Handle = instanceHandle,
+                FieldId = fieldId,
+                FieldData = data,
+                FloatValue = duration,
+            });
+
+            return enqueued ? new ForceFieldHandle(instanceHandle, fieldId) : ForceFieldHandle.Invalid;
+        }
+
+        /// <summary>实时更新指定全局或局部力场的参数数据（例如跟随 Boss/玩家移动的引力井或旋涡）。</summary>
+        public void UpdateForceField(ForceFieldHandle handle, in ForceFieldData data)
+        {
+            if (!handle.IsValid || !_started || _stopRequested || _disposed)
+                return;
+
+            ParticleUpdateDomain domain = ParticleUpdateDomain.World;
+            if (handle.IsInstanceLocal && !TryGetRegisteredDomain(handle.SystemHandle, out domain))
+                return;
+
+            EnqueueControlCommand(new ControlCommand
+            {
+                Kind = ControlCommandKind.UpdateForceField,
+                Domain = domain,
+                Handle = handle.SystemHandle,
+                FieldId = handle.FieldId,
+                FieldData = data,
+            });
+        }
+
+        /// <summary>移除指定的全局或局部力场。</summary>
+        public void RemoveForceField(ForceFieldHandle handle)
+        {
+            if (!handle.IsValid || !_started || _stopRequested || _disposed)
+                return;
+
+            ParticleUpdateDomain domain = ParticleUpdateDomain.World;
+            if (handle.IsInstanceLocal && !TryGetRegisteredDomain(handle.SystemHandle, out domain))
+                return;
+
+            EnqueueControlCommand(new ControlCommand
+            {
+                Kind = ControlCommandKind.RemoveForceField,
+                Domain = domain,
+                Handle = handle.SystemHandle,
+                FieldId = handle.FieldId,
+            });
+        }
+
+        /// <summary>立即清空全部全局世界力场。</summary>
+        public void ClearGlobalForceFields()
+        {
+            if (!_started || _stopRequested || _disposed)
+                return;
+
+            EnqueueControlCommand(new ControlCommand
+            {
+                Kind = ControlCommandKind.ClearGlobalForceFields,
+                Domain = ParticleUpdateDomain.World,
+            });
+        }
+
         /// <summary>投递一个将在粒子工作线程独占执行的自定义操作（用于后续发射与迁移指令扩展）。</summary>
         internal void EnqueueWorkerAction(Action<ParticleRuntime> action, ParticleUpdateDomain domain = ParticleUpdateDomain.World)
         {
@@ -926,13 +1031,19 @@ namespace Apotheosis.Runtime.Particles.Core
             // 5. 推进已挂载持续发射器（在最新原点快照落地后发射，使出生粒子与单次爆发同帧经历完整模拟管线）
             TickAttachedEmitters(_workerPacket.DeltaTime, _workerPacket.IsWorldPaused, _workerPacket.IsGameMenu);
 
-            // 6. 驱动已注册的模拟管线与渲染三缓冲打包
+            // 6. 推进模拟时钟（限时力场扣减排在 StepSimulation 之后，确保单帧冲击波脉冲至少完整生效 1 帧）
+            AdvanceSimulationClock(_workerPacket.DeltaTime, _workerPacket.IsWorldPaused, _workerPacket.IsGameMenu);
+
+            // 7. 驱动已注册的模拟管线、扣减限时力场寿命并打包渲染三缓冲
             IParticleRuntimePipeline? pipeline = _pipeline;
             if (pipeline is not null)
             {
                 ReadOnlySpan<ParticleInstance> instancesSpan = CollectionsMarshal.AsSpan(_activeInstances);
-                pipeline.StepSimulation(_globalWorldSlot, instancesSpan, _workerPacket.DeltaTime, _workerPacket.IsWorldPaused, _workerPacket.IsGameMenu);
+                ReadOnlySpan<ForceFieldData> globalFieldsSpan = GetGlobalFieldsSpan();
+                pipeline.StepSimulation(_globalWorldSlot, instancesSpan, _workerPacket.DeltaTime, _simulationTime,
+                    globalFieldsSpan, _workerPacket.IsWorldPaused, _workerPacket.IsGameMenu);
 
+                TickForceFieldDurations(_workerPacket.DeltaTime, _workerPacket.IsWorldPaused, _workerPacket.IsGameMenu);
                 PlaybackAllCommandBuffers();
                 ReapFinishedInstances();
 
@@ -941,6 +1052,7 @@ namespace Apotheosis.Runtime.Particles.Core
             }
             else
             {
+                TickForceFieldDurations(_workerPacket.DeltaTime, _workerPacket.IsWorldPaused, _workerPacket.IsGameMenu);
                 PlaybackAllCommandBuffers();
                 ReapFinishedInstances();
             }
@@ -1075,6 +1187,54 @@ namespace Apotheosis.Runtime.Particles.Core
                             break;
                         }
 
+                        case ControlCommandKind.AddForceField:
+                        {
+                            if (!cmd.Handle.IsValid)
+                            {
+                                AddGlobalFieldOnWorker(cmd.FieldId, in cmd.FieldData, cmd.FloatValue);
+                            }
+                            else if (TryGetWorkerInstance(cmd.Handle, out ParticleInstance? inst) && inst is not null)
+                            {
+                                inst.AddLocalFieldOnWorker(cmd.FieldId, in cmd.FieldData, cmd.FloatValue);
+                            }
+
+                            break;
+                        }
+
+                        case ControlCommandKind.UpdateForceField:
+                        {
+                            if (!cmd.Handle.IsValid)
+                            {
+                                UpdateGlobalFieldOnWorker(cmd.FieldId, in cmd.FieldData);
+                            }
+                            else if (TryGetWorkerInstance(cmd.Handle, out ParticleInstance? inst) && inst is not null)
+                            {
+                                inst.UpdateLocalFieldOnWorker(cmd.FieldId, in cmd.FieldData);
+                            }
+
+                            break;
+                        }
+
+                        case ControlCommandKind.RemoveForceField:
+                        {
+                            if (!cmd.Handle.IsValid)
+                            {
+                                RemoveGlobalFieldOnWorker(cmd.FieldId);
+                            }
+                            else if (TryGetWorkerInstance(cmd.Handle, out ParticleInstance? inst) && inst is not null)
+                            {
+                                inst.RemoveLocalFieldOnWorker(cmd.FieldId);
+                            }
+
+                            break;
+                        }
+
+                        case ControlCommandKind.ClearGlobalForceFields:
+                        {
+                            ClearGlobalFieldsOnWorker();
+                            break;
+                        }
+
                         case ControlCommandKind.ClearEmitters:
                         {
                             if (TryGetWorkerInstance(cmd.Handle, out ParticleInstance? inst) && inst is not null)
@@ -1169,7 +1329,7 @@ namespace Apotheosis.Runtime.Particles.Core
 
         private void TickAttachedEmitters(float deltaTime, bool isWorldPaused, bool isGameMenu)
         {
-            if (!(deltaTime > 0f) || _activeInstances.Count == 0)
+            if (!float.IsFinite(deltaTime) || !(deltaTime > 0f) || _activeInstances.Count == 0)
                 return;
 
             bool stepWorld = !isWorldPaused && !isGameMenu;
@@ -1193,7 +1353,7 @@ namespace Apotheosis.Runtime.Particles.Core
                     continue;
 
                 float effectiveDt = deltaTime * inst.TimeScale;
-                if (!(effectiveDt > 0f))
+                if (!float.IsFinite(effectiveDt) || !(effectiveDt > 0f))
                     continue;
 
                 inst.TickEmittersOnWorker(effectiveDt, ref _workerRng, _logWorkerExceptionCallback);
@@ -1208,13 +1368,38 @@ namespace Apotheosis.Runtime.Particles.Core
             switch (policy)
             {
                 case ParticleHostLostPolicy.ClearImmediate:
+                    inst.ClearLocalFieldsOnWorker();
                     inst.StoreSlot?.ClearEntities();
                     inst.State = ParticleInstanceState.Disposing;
                     break;
 
                 case ParticleHostLostPolicy.DetachToGlobal:
-                    // 完整跨 Store 烘焙迁移将在 Step 6 接入，当前安全回退为停止发射等待自然消亡
-                    inst.State = ParticleInstanceState.Stopping;
+                    if (inst.UpdateDomain == ParticleUpdateDomain.World)
+                    {
+                        // 异常隔离：确保迁移失败时不会中断批量命令/原点更新或导致下帧死循环重复拷贝
+                        try
+                        {
+                            inst.StoreSlot?.PlaybackCommandBuffer();
+                            if (inst.ParticleCount > 0)
+                                ParticleStoreMigrator.MigrateToGlobalOnWorker(inst, _globalWorldSlot);
+                        }
+                        catch (Exception ex)
+                        {
+                            LogWorkerException("DetachToGlobal", ex);
+                        }
+                        finally
+                        {
+                            inst.StoreSlot?.ClearEntities();
+                            inst.ClearLocalFieldsOnWorker();
+                            inst.State = ParticleInstanceState.Disposing;
+                        }
+                    }
+                    else
+                    {
+                        // UI 域子系统不跨入世界全局存储，安全回退为自然淡出
+                        inst.State = ParticleInstanceState.Stopping;
+                    }
+
                     break;
 
                 default:
@@ -1223,10 +1408,135 @@ namespace Apotheosis.Runtime.Particles.Core
             }
         }
 
+        private void AddGlobalFieldOnWorker(uint fieldId, in ForceFieldData data, float duration)
+        {
+            if (fieldId == 0)
+                return;
+
+            bool hasDuration = float.IsFinite(duration) && duration > 0f;
+            _globalFields.Add(new ActiveForceFieldEntry
+            {
+                FieldId = fieldId,
+                Data = data,
+                RemainingDuration = hasDuration ? duration : 0f,
+                HasDuration = hasDuration,
+            });
+            _globalFieldsDirty = true;
+        }
+
+        private void UpdateGlobalFieldOnWorker(uint fieldId, in ForceFieldData data)
+        {
+            for (int i = 0; i < _globalFields.Count; i++)
+            {
+                if (_globalFields[i].FieldId != fieldId)
+                    continue;
+
+                ActiveForceFieldEntry entry = _globalFields[i];
+                entry.Data = data;
+                _globalFields[i] = entry;
+                _globalFieldsDirty = true;
+                return;
+            }
+        }
+
+        private void RemoveGlobalFieldOnWorker(uint fieldId)
+        {
+            for (int i = 0; i < _globalFields.Count; i++)
+            {
+                if (_globalFields[i].FieldId != fieldId)
+                    continue;
+
+                _globalFields.RemoveAt(i);
+                _globalFieldsDirty = true;
+                return;
+            }
+        }
+
+        private void ClearGlobalFieldsOnWorker()
+        {
+            _globalFields.Clear();
+            _globalFieldDataCache.Clear(clearReferences: false);
+            _globalFieldsDirty = false;
+        }
+
+        private void AdvanceSimulationClock(float deltaTime, bool isWorldPaused, bool isGameMenu)
+        {
+            if (!float.IsFinite(deltaTime) || !(deltaTime > 0f))
+                return;
+
+            if (!isWorldPaused && !isGameMenu)
+                _simulationTime += deltaTime;
+        }
+
+        private void TickForceFieldDurations(float deltaTime, bool isWorldPaused, bool isGameMenu)
+        {
+            if (!float.IsFinite(deltaTime) || !(deltaTime > 0f))
+                return;
+
+            bool stepWorld = !isWorldPaused && !isGameMenu;
+            if (stepWorld)
+            {
+                for (int i = _globalFields.Count - 1; i >= 0; i--)
+                {
+                    ActiveForceFieldEntry entry = _globalFields[i];
+                    if (!entry.HasDuration)
+                        continue;
+
+                    entry.RemainingDuration -= deltaTime;
+                    if (!(entry.RemainingDuration > 0f))
+                    {
+                        _globalFields.RemoveAt(i);
+                        _globalFieldsDirty = true;
+                    }
+                    else
+                    {
+                        _globalFields[i] = entry;
+                    }
+                }
+            }
+
+            for (int i = 0; i < _activeInstances.Count; i++)
+            {
+                ParticleInstance inst = _activeInstances[i];
+                if (inst.UpdateDomain == ParticleUpdateDomain.World && !stepWorld)
+                    continue;
+
+                float effectiveDt = deltaTime * inst.TimeScale;
+                if (float.IsFinite(effectiveDt) && effectiveDt > 0f)
+                    inst.TickLocalFieldDurationsOnWorker(effectiveDt);
+            }
+        }
+
+        private ReadOnlySpan<ForceFieldData> GetGlobalFieldsSpan()
+        {
+            if (_globalFields.Count == 0)
+                return ReadOnlySpan<ForceFieldData>.Empty;
+
+            if (_globalFieldsDirty)
+            {
+                _globalFieldDataCache.Clear(clearReferences: false);
+                for (int i = 0; i < _globalFields.Count; i++)
+                {
+                    ForceFieldData d = _globalFields[i].Data;
+                    _globalFieldDataCache.Add(in d);
+                }
+
+                _globalFieldsDirty = false;
+            }
+
+            return _globalFieldDataCache.AsReadOnlySpan();
+        }
+
         private uint AllocateEmitterId()
         {
             uint id = Interlocked.Increment(ref _nextEmitterId);
             return id != 0 ? id : Interlocked.Increment(ref _nextEmitterId);
+        }
+
+        private uint AllocateFieldId()
+        {
+            uint id = Interlocked.Increment(ref _nextFieldId);
+            return id != 0 ? id : Interlocked.Increment(ref _nextFieldId);
         }
 
         private void PlaybackAllCommandBuffers()
@@ -1286,7 +1596,9 @@ namespace Apotheosis.Runtime.Particles.Core
                 _submittedPacket.OriginUpdates.Clear(clearReferences: false);
             }
 
-            // 2. 清空全局存储并回收所有 World 域小型子系统；补齐保留 Ui 指令的命令回放与实例回收
+            // 2. 清空全局存储、全局世界力场并回收所有 World 域小型子系统；补齐保留 Ui 指令的命令回放与实例回收
+            ClearGlobalFieldsOnWorker();
+            _simulationTime = 0f;
             _globalWorldSlot.ClearEntities();
             for (int i = _activeInstances.Count - 1; i >= 0; i--)
             {
@@ -1314,6 +1626,8 @@ namespace Apotheosis.Runtime.Particles.Core
         private void CleanupAllStoresOnWorker()
         {
             // 仅在工作线程永久退出前执行一次：直接线性清空，无需归还对象池或逐个释放注册表
+            ClearGlobalFieldsOnWorker();
+            _simulationTime = 0f;
             _globalWorldSlot.ClearEntities();
             for (int i = 0; i < _activeInstances.Count; i++)
             {

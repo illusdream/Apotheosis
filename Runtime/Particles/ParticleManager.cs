@@ -4,6 +4,7 @@ using System;
 using Apotheosis.Runtime.Foundation.Transform;
 using Apotheosis.Runtime.Particles.Core;
 using Apotheosis.Runtime.Particles.Emitters;
+using Apotheosis.Runtime.Particles.Fields;
 using Apotheosis.Runtime.Particles.Fragments;
 using Apotheosis.Runtime.Particles.Systems;
 using Apotheosis.Runtime.Rendering.Targets;
@@ -309,6 +310,34 @@ namespace Apotheosis.Runtime.Particles
 
             ParticleWorldSystem.Runtime?.EmitToInstance(handle, template, count, initializer);
         }
+
+        // ==================== 全局与局部粒子力场 ====================
+
+        /// <summary>向全局世界添加一个粒子力场并返回句柄（<paramref name="duration"/> &gt; 0 时到期自动销毁）。</summary>
+        public static ForceFieldHandle AddGlobalForceField(in ForceFieldData data, float duration = 0f)
+        {
+            ParticleRuntime? rt = ParticleWorldSystem.Runtime;
+            return rt is not null ? rt.AddGlobalForceField(in data, duration) : ForceFieldHandle.Invalid;
+        }
+
+        /// <summary>向指定小型独立粒子子系统挂载一个专属局部力场并返回句柄（随子系统回收自动清除）。</summary>
+        public static ForceFieldHandle AddInstanceForceField(ParticleSystemHandle instanceHandle, in ForceFieldData data, float duration = 0f)
+        {
+            ParticleRuntime? rt = ParticleWorldSystem.Runtime;
+            return rt is not null ? rt.AddInstanceForceField(instanceHandle, in data, duration) : ForceFieldHandle.Invalid;
+        }
+
+        /// <summary>实时更新指定全局或局部力场的参数（如跟随实体移动的位置或动态变化的强度）。</summary>
+        public static void UpdateForceField(ForceFieldHandle handle, in ForceFieldData data)
+            => ParticleWorldSystem.Runtime?.UpdateForceField(handle, in data);
+
+        /// <summary>移除指定的全局或局部力场。</summary>
+        public static void RemoveForceField(ForceFieldHandle handle)
+            => ParticleWorldSystem.Runtime?.RemoveForceField(handle);
+
+        /// <summary>清空全部全局世界力场。</summary>
+        public static void ClearGlobalForceFields()
+            => ParticleWorldSystem.Runtime?.ClearGlobalForceFields();
 
         // ==================== 管线扩展注册 ====================
 
