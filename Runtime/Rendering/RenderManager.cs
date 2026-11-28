@@ -22,6 +22,7 @@ namespace Apotheosis.Runtime.Rendering
     {
         private static readonly object _lifecycleLock = new();
         private static volatile bool _unloading;
+        private static int _activePreDrawSubmitCount;
 
         private static RenderFrameContext _frameContext;
         private static ulong _frameCounter;
@@ -151,6 +152,15 @@ namespace Apotheosis.Runtime.Rendering
             lock (_lifecycleLock)
             {
                 OnPreDrawSubmit = null;
+            }
+
+            // 等待锁外可能正在运行的 OnPreDrawSubmit 回调完整返回后再卸载各渲染子模块，避免并发访问已卸载模块
+            var spin = new SpinWait();
+            while (Volatile.Read(ref _activePreDrawSubmitCount) > 0)
+                spin.SpinOnce();
+
+            lock (_lifecycleLock)
+            {
 #if DEBUG
                 _shaderHotReloader?.Dispose();
                 _shaderHotReloader = null;
@@ -202,11 +212,23 @@ namespace Apotheosis.Runtime.Rendering
                 _lastDeltaTime = (float)gameTime.ElapsedGameTime.TotalSeconds;
                 _contextCaptured = false;
                 submitHandlers = OnPreDrawSubmit;
+                if (submitHandlers is not null)
+                    Interlocked.Increment(ref _activePreDrawSubmitCount);
             }
 
             // 锁外触发帧前提交事件，避免订阅方内部持锁或提交命令引发锁序死锁
-            if (!_unloading)
-                submitHandlers?.Invoke();
+            if (submitHandlers is not null)
+            {
+                try
+                {
+                    if (!_unloading)
+                        submitHandlers.Invoke();
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref _activePreDrawSubmitCount);
+                }
+            }
         }
 
         private static void Hook_DoDraw(On_Main.orig_DoDraw orig, Main self, GameTime gameTime)
