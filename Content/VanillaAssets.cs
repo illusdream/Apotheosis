@@ -137,9 +137,9 @@ namespace Apotheosis
             public static Asset<Texture2D> FallingStar => _fallingStar ??= ModContent.Request<Texture2D>(FallingStarPath);
 
             /// <summary><c>Extra_98</c>（<see cref="ExtrasID.SharpTears"/>）：经典锐利十字菱形星芒（高光/星芒/刀光常用）。</summary>
-            public const string SharpTearsPath = "Terraria/Images/Extra_98";
-            private static Asset<Texture2D>? _sharpTears;
-            public static Asset<Texture2D> SharpTears => _sharpTears ??= ModContent.Request<Texture2D>(SharpTearsPath);
+            public const string Extra98Path = "Terraria/Images/Extra_98";
+            private static Asset<Texture2D>? _extra98;
+            public static Asset<Texture2D> Extra98 => _extra98 ??= ModContent.Request<Texture2D>(Extra98Path);
 
             /// <summary><c>Extra_174</c>（<see cref="ExtrasID.KeybrandRing"/>）：圆环冲击波。</summary>
             public const string KeybrandRingPath = "Terraria/Images/Extra_174";
@@ -273,7 +273,7 @@ namespace Apotheosis
                 _portalGateHalo = null;
                 _thePerfectGlow = null;
                 _fallingStar = null;
-                _sharpTears = null;
+                _extra98 = null;
                 _keybrandRing = null;
                 _voronoiNoise = null;
                 _flameLashTrailShape = null;

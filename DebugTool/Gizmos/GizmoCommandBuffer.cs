@@ -493,10 +493,8 @@ namespace Apotheosis.DebugTool.Gizmos
             }
         }
 
-        /// <summary>
-        /// 在渲染帧中追加采集全部已注册的 <see cref="IGizmoProvider"/> 与可选即时回调（不清除本帧 <c>PreDraw</c>/<c>PostDraw</c> 已写入的 Overlay）。
-        /// </summary>
-        public void CollectOverlayProvidersLocked(Action? extraOverlayEmitter)
+        /// <summary>在渲染帧中追加采集全部已注册的 <see cref="IGizmoProvider"/>。</summary>
+        public void CollectOverlayProvidersLocked()
         {
             if (!IsEnabled)
                 return;
@@ -522,8 +520,6 @@ namespace Apotheosis.DebugTool.Gizmos
                         // 单个 Provider 异常不阻断调试绘制与游戏主循环
                     }
                 }
-
-                extraOverlayEmitter?.Invoke();
             }
             finally
             {

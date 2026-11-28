@@ -7,7 +7,6 @@ using Apotheosis.DebugTool.Theme;
 using Apotheosis.Runtime.Foundation.Diagnostics;
 using Hexa.NET.ImGui;
 using Microsoft.Xna.Framework;
-using Terraria;
 using Terraria.ModLoader;
 using NumVec2 = System.Numerics.Vector2;
 using NumVec4 = System.Numerics.Vector4;
@@ -24,8 +23,6 @@ namespace Apotheosis.DebugTool.Gizmos
     [NoJIT]
     internal sealed class GizmoOverlayRenderer
     {
-        private const string SelfTestChannel = "SelfTest";
-
         private delegate bool DrawPayloadDelegate<TPayload>(
             ref RenderContext ctx,
             in GizmoMeta meta,
@@ -57,7 +54,6 @@ namespace Apotheosis.DebugTool.Gizmos
         private readonly List<NumVec2> _sectorScratch = new(128);
         private ulong[] _enabledChannelBits = new ulong[2];
 
-        private static readonly Action EmitSelfTestDemoAction = EmitSelfTestDemo;
         private static readonly DrawPayloadDelegate<MarkerPayload> DrawMarkerHandler = DrawMarker;
         private static readonly DrawPayloadDelegate<SegmentPayload> DrawSegmentHandler = DrawSegment;
         private static readonly DrawPayloadDelegate<PolyPayload> DrawPolyHandler = DrawPoly;
@@ -89,7 +85,7 @@ namespace Apotheosis.DebugTool.Gizmos
 
             lock (buffer.SyncRoot)
             {
-                buffer.CollectOverlayProvidersLocked(settings.ShowSelfTestDemo ? EmitSelfTestDemoAction : null);
+                buffer.CollectOverlayProvidersLocked();
 
                 // 在采集完 Provider 之后单次加锁快照全部频道位图，后续逐图元无锁 O(1) 判定
                 settings.CopyEnabledBitsSnapshot(ref _enabledChannelBits, out int enabledWordCount);
@@ -645,51 +641,6 @@ namespace Apotheosis.DebugTool.Gizmos
                 color.G / 255f,
                 color.B / 255f,
                 a));
-        }
-
-        /// <summary>
-        /// 纯几何自检 Demo：围绕本地玩家绘制全套基建图元，用于一键验证缩放、重力翻转与视口对齐。
-        /// </summary>
-        private static void EmitSelfTestDemo()
-        {
-            if (Main.myPlayer < 0 || Main.myPlayer >= Main.player.Length)
-                return;
-
-            Player? player = Main.player[Main.myPlayer];
-            if (player is null || !player.active)
-                return;
-
-            Vector2 center = player.Center;
-            float t = (float)Main.timeForVisualEffects * 0.04f;
-
-            DebugGizmos.Cross(center, Color.White, sizePixels: 10f, channel: SelfTestChannel);
-            DebugGizmos.Axes2D(center, rotation: t * 0.6f, length: 42f, channel: SelfTestChannel);
-
-            DebugGizmos.Rect(player.Hitbox, new Color(0, 240, 255), filled: true, fillAlpha: 0.14f, channel: SelfTestChannel);
-            DebugGizmos.OBB(center + new Vector2(110f, -20f), new Vector2(64f, 28f), t, new Color(255, 42, 133), filled: true, fillAlpha: 0.18f, channel: SelfTestChannel);
-
-            DebugGizmos.Circle(center, 84f, new Color(0, 240, 255), filled: false, channel: SelfTestChannel);
-            DebugGizmos.Sector(center, 118f, startAngle: t - 0.45f, sweepAngle: 0.9f, new Color(252, 238, 10), filled: true, fillAlpha: 0.14f, channel: SelfTestChannel);
-
-            Vector2 p0 = center + new Vector2(-130f, -50f);
-            Vector2 p1 = center + new Vector2(-95f, -120f + MathF.Sin(t * 1.8f) * 28f);
-            Vector2 p2 = center + new Vector2(-45f, 10f + MathF.Cos(t * 1.5f) * 28f);
-            Vector2 p3 = center + new Vector2(-10f, -75f);
-            DebugGizmos.DashedLine(p0, p1, new Color(140, 165, 195), channel: SelfTestChannel);
-            DebugGizmos.DashedLine(p2, p3, new Color(140, 165, 195), channel: SelfTestChannel);
-            DebugGizmos.BezierCubic(p0, p1, p2, p3, new Color(43, 245, 157), channel: SelfTestChannel);
-
-            if (player.velocity.LengthSquared() > 0.01f)
-                DebugGizmos.Ray(center, player.velocity * 12f, new Color(252, 238, 10), channel: SelfTestChannel);
-
-            string flipTag = Main.GameViewMatrix.TransformationMatrix.M22 < 0f ? "FLIP_Y" : "NORMAL";
-            string pauseTag = Main.gamePaused ? " | PAUSED" : string.Empty;
-            DebugGizmos.Label(
-                center + new Vector2(0f, -64f),
-                $"GIZMO_OK | ({center.X:0}, {center.Y:0}) | Zoom {Main.GameViewMatrix.Zoom.X:0.00}x | {flipTag}{pauseTag}",
-                new Color(0, 240, 255),
-                screenOffset: new Vector2(-95f, -26f),
-                channel: SelfTestChannel);
         }
     }
 }

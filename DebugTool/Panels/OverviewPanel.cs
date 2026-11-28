@@ -7,12 +7,9 @@ using System.Numerics;
 using Apotheosis.DebugTool.Core;
 using Apotheosis.DebugTool.Gizmos;
 using Apotheosis.DebugTool.Theme;
-using Apotheosis.Runtime.Foundation.Diagnostics;
 using Hexa.NET.ImGui;
 using Terraria;
 using Terraria.ModLoader;
-using XnaColor = Microsoft.Xna.Framework.Color;
-using XnaVec2 = Microsoft.Xna.Framework.Vector2;
 
 namespace Apotheosis.DebugTool.Panels
 {
@@ -162,14 +159,7 @@ namespace Apotheosis.DebugTool.Panels
                 $"本帧绘制: {buffer.LastRenderedCount}  |  剔除: {buffer.LastCulledCount}  |  延时: {buffer.TimedCount}  |  Provider: {buffer.ProviderCount}");
             ImGui.PopStyleColor();
 
-            // 纯几何自检与延时脉冲按钮
-            ImGui.Checkbox("纯几何自检 Demo (围绕玩家绘制全套图元)", ref settings.ShowSelfTestDemo);
-
             float btnH = ImGui.GetTextLineHeight() + 8f;
-            if (ImGui.Button("发射延时测试 (+2s)", new Vector2(152f, btnH)))
-                EmitTimedTestPulse();
-
-            ImGui.SameLine(0f, 8f);
             if (ImGui.Button("清空延时图元", new Vector2(118f, btnH)))
                 buffer.ClearTimed();
 
@@ -236,25 +226,6 @@ namespace Apotheosis.DebugTool.Panels
 
                 ImGui.TreePop();
             }
-        }
-
-        private static void EmitTimedTestPulse()
-        {
-            if (Main.gameMenu || Main.myPlayer < 0 || Main.myPlayer >= Main.player.Length)
-                return;
-
-            Player? player = Main.player[Main.myPlayer];
-            if (player is null || !player.active)
-                return;
-
-            XnaVec2 origin = player.Center;
-            const float duration = 2.0f;
-            const string channel = "SelfTest";
-
-            DebugGizmos.Circle(origin, 64f, new XnaColor(255, 42, 133), filled: true, fillAlpha: 0.14f, duration: duration, channel: channel);
-            DebugGizmos.Cross(origin, new XnaColor(252, 238, 10), sizePixels: 14f, duration: duration, channel: channel);
-            DebugGizmos.Arrow(origin, origin + new XnaVec2(0f, -72f), new XnaColor(43, 245, 157), duration: duration, channel: channel);
-            DebugGizmos.Label(origin + new XnaVec2(0f, -80f), "TIMED_PULSE (2.0s)", new XnaColor(255, 42, 133), new XnaVec2(-62f, -18f), duration: duration, channel: channel);
         }
 
         private static int CountActiveNpcs()

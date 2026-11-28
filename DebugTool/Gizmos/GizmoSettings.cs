@@ -35,9 +35,6 @@ namespace Apotheosis.DebugTool.Gizmos
         /// <summary>单帧图元数量上限（保护渲染性能与顶点缓冲）。</summary>
         public int MaxCommandsPerFrame = 4096;
 
-        /// <summary>纯几何图元自检 Demo 开关（围绕本地玩家绘制全套图元，用于验收对齐与缩放）。</summary>
-        public bool ShowSelfTestDemo = false;
-
         /// <summary>获取或注册频道名对应的紧凑 2 字节密集 ID（首次注册默认启用）。</summary>
         public ushort GetOrRegisterChannel(string channel)
         {
